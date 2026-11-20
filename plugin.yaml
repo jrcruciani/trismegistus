@@ -1,0 +1,135 @@
+manifest_version: 2
+name: trismegistus
+version: "0.1.0"
+requires_hermes: ">=0.23.0"
+author: Jorge Luis Revilla
+description: "Three-stage System-1 / System-2 cognitive router (Triage -> Modulation -> Call) powered by Microsoft-Decision-1.1 on Foundry (or local decision models) and wire-safe across GitHub Copilot models."
+provides_tools:
+  - trismegistus_decide
+  - trismegistus_escalate
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - pre_verify
+  - post_api_request
+provides_middleware:
+  - llm_request
+  - llm_execution
+capabilities:
+  - llm.model_override
+  - llm.provider_override
+config_schema:
+  mode:
+    type: str
+    choices: [shadow, effort_only, tier_and_effort]
+    default: shadow
+    label: "Operating mode"
+    description: "shadow logs System-1 verdicts without mutating calls; effort_only modulates reasoning_effort (100% KV-cache warm); tier_and_effort switches wire-compatible Copilot models + effort."
+  backend:
+    type: str
+    choices: [foundry_systemone, local_systemone, local_logits, hermes_aux]
+    default: foundry_systemone
+    label: "System-1 Decision Backend"
+    description: "foundry_systemone (Microsoft-Decision-1.1 on Foundry /providers/microsoft/v1/systemone), local_systemone (open-jev / SystemOne API), local_logits (llama.cpp / vLLM / Ollama 1-token logprobs), or hermes_aux (Hermes auxiliary.trismegistus_decider)."
+  foundry_endpoint:
+    type: str
+    default: ""
+    label: "Microsoft Foundry Resource Endpoint"
+    description: "Foundry endpoint URL (e.g. https://<resource>.services.ai.azure.com); /providers/microsoft/v1/systemone is appended automatically if omitted."
+  foundry_deployment:
+    type: str
+    default: "microsoft-decision-1.1"
+    label: "Foundry Deployment Name"
+    description: "Deployment name in Microsoft Foundry for Microsoft-Decision-1.1 (sent as the request 'model' field)."
+  foundry_auth_header:
+    type: str
+    choices: [api-key, bearer]
+    default: api-key
+    label: "Foundry Auth Header Mode"
+    description: "api-key sends 'api-key: <secret>'; bearer sends 'Authorization: Bearer <secret>'."
+  foundry_api_key:
+    type: secret
+    env: TRISMEGISTUS_FOUNDRY_API_KEY
+    label: "Foundry API Key / Token"
+    description: "API key or bearer token for Microsoft Foundry (stored in profile .env, never in config.yaml)."
+  local_endpoint:
+    type: str
+    default: "http://127.0.0.1:8080/v1"
+    label: "Local Decision Endpoint"
+    description: "Base URL for local_systemone (/v1/systemone) or local_logits (/v1/chat/completions)."
+  local_model:
+    type: str
+    default: "gemma-4-26b-a4b"
+    label: "Local Decision Model ID"
+    description: "Model identifier sent to local_systemone or local_logits."
+  local_api_key:
+    type: secret
+    env: TRISMEGISTUS_LOCAL_API_KEY
+    label: "Local Endpoint API Key (optional)"
+    description: "Optional bearer key for a protected local inference server."
+  confidence_threshold:
+    type: float
+    default: 0.65
+    label: "Calibrated Confidence Threshold"
+    description: "Minimum calibrated top probability required to accept a System-1 downgrade; below this threshold Trismegistus abstains and defaults to System 2."
+  system1_model:
+    type: str
+    default: ""
+    label: "Explicit System-1 Model Override"
+    description: "Optional fast model ID on the active provider (leave empty to auto-select the wire-compatible GitHub Copilot System-1 peer, e.g. claude-haiku-4.5, gpt-5.4-mini, gemini-3-flash-preview, gpt-5-mini)."
+  system2_model:
+    type: str
+    default: ""
+    label: "Explicit System-2 Model Override"
+    description: "Optional deep-reasoning model ID on the active provider (leave empty to keep the session's active model or auto-select the Copilot System-2 peer)."
+  delegation_provider:
+    type: str
+    default: "copilot"
+    label: "Delegation Target Provider"
+    description: "Provider used when delegation.backend is set to 'trismegistus' (default: copilot)."
+  delegation_system1_model:
+    type: str
+    default: "claude-haiku-4.5"
+    label: "Delegation System-1 Model"
+    description: "Model assigned to routine delegate_task subagents."
+  delegation_system2_model:
+    type: str
+    default: "gpt-5.4"
+    label: "Delegation System-2 Model"
+    description: "Model assigned to complex architectural or debugging delegate_task subagents."
+  escalate_after_errors:
+    type: int
+    default: 2
+    label: "Auto-escalate After Tool Errors"
+    description: "Consecutive tool errors in a session before automatically escalating the rest of the turn to System 2."
+  sticky_system2_within_turn:
+    type: bool
+    default: true
+    label: "Sticky System-2 Within Turn"
+    description: "Keep System 2 active across tool-loop iterations once triggered so prompt KV cache is never invalidated mid-turn."
+  tool_gate_enabled:
+    type: bool
+    default: false
+    label: "Enable System-1 Mutating Tool Gate"
+    description: "Evaluate terminal/write_file/patch/browser_exec calls with a calibrated noul risk check and escalate risky calls to human approval."
+  tool_risk_threshold:
+    type: float
+    default: 0.82
+    label: "Mutating Tool Approval Threshold"
+    description: "Calibrated probability threshold (0-1) above which pre_tool_call requests human approval."
+  verify_gate_enabled:
+    type: bool
+    default: false
+    label: "Enable System-1 Code Verification Gate"
+    description: "When code was edited in the turn, check via pre_verify whether verification evidence is present before stopping."
+  timeout_seconds:
+    type: float
+    default: 4.0
+    label: "Decision Timeout (seconds)"
+    description: "Hard wall-clock budget for System-1 triage calls (fail-open to System 2 on timeout)."
+  max_excerpt_chars:
+    type: int
+    default: 2400
+    label: "Max Redacted Excerpt Characters"
+    description: "Maximum redacted prompt characters included in System-1 triage state."
