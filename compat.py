@@ -73,6 +73,9 @@ def open_safe_url(
 
         return open_credentialed_url(request, timeout=timeout, opener_factory=opener_factory)
     except ImportError:
+        if opener_factory is not None:
+            opener = opener_factory(urllib.request.HTTPRedirectHandler())
+            return opener.open(request, timeout=timeout)
         return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - standalone test fallback
 
 
