@@ -7,9 +7,10 @@ from typing import Any, Literal
 
 QuestionType = Literal["noul", "choice", "score"]
 CognitiveTier = Literal["system1", "system2"]
-EffortLevel = Literal["minimal", "low", "medium", "high", "xhigh"]
+EffortLevel = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
 
-EFFORT_LADDER: tuple[str, ...] = ("minimal", "low", "medium", "high")
+# 5-level precision effort scale mapped onto score indices 0..4
+EFFORT_LADDER: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,9 @@ class TriageVerdict:
     decision_model: str
     decision_latency_ms: float
     decision_input_tokens: int = 0
+    trap_risk_prob: float = 0.0
+    trap_blocked: bool = False
+    step_paced: bool = False
     error: str | None = None
     applied_model: str = ""
     applied_effort: str = ""
@@ -149,6 +153,10 @@ class TriageVerdict:
         flags: list[str] = []
         if self.abstained:
             flags.append("abstained->s2")
+        if self.trap_blocked:
+            flags.append("trap_guard->s2")
+        if self.step_paced:
+            flags.append("step_paced")
         if self.sticky_override:
             flags.append("sticky->s2")
         if self.error_streak_override:
@@ -160,6 +168,6 @@ class TriageVerdict:
         suffix = f" [{'|'.join(flags)}]" if flags else ""
         return (
             f"tier={self.effective_tier} effort={self.effective_effort} "
-            f"score={self.effort_score:.2f} conf={self.confidence:.2f} "
-            f"triage_ms={self.decision_latency_ms:.0f}{suffix}"
+            f"score={self.effort_score:.2f} trap={self.trap_risk_prob:.2f} "
+            f"conf={self.confidence:.2f} triage_ms={self.decision_latency_ms:.0f}{suffix}"
         )

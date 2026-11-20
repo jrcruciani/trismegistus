@@ -1,4 +1,4 @@
-"""Stage 1 (Triage): calibrated System-1 turn classification, tool reflex, and verify gate."""
+"""Stage 1 (Triage): precision-calibrated System-1 turn classification, trap gate, and verify gate."""
 
 from __future__ import annotations
 
@@ -26,11 +26,18 @@ TURN_QUESTIONS: dict[str, DecisionQuestion] = {
     "effort": DecisionQuestion.score(
         "How much deliberative reasoning depth does this request require?",
         [
-            "Minimal: trivial acknowledgement, lookup, or one-liner",
-            "Low: routine single-step task or clear small edit",
+            "Minimal: trivial acknowledgement, pure formatting, or simple lookup",
+            "Low: routine single-step task or clear localized edit",
             "Medium: multi-step reasoning, code analysis, or structured synthesis",
-            "High: deep debugging, subtle concurrency/security analysis, or system architecture",
+            "High: complex debugging, multi-file refactor, or architectural design",
+            "XHigh: subtle race condition, cryptographic/security invariant, formal root-cause proof, or deep reverse engineering",
         ],
+    ),
+    "trap_risk": DecisionQuestion.noul(
+        "Could this request hide subtle side effects, concurrency/state hazards, security/auth invariants, "
+        "edge-case pitfalls, or implicit constraints from prior context despite looking short?",
+        when_true="Contains hidden coupling, subtle edge cases, security/state risk, or implicit context dependencies",
+        when_false="Self-contained, transparent request with low risk of subtle misinterpretation",
     ),
     "needs_plan": DecisionQuestion.noul(
         "Should the agent formulate an explicit step-by-step verification plan before acting?",
@@ -40,6 +47,9 @@ TURN_QUESTIONS: dict[str, DecisionQuestion] = {
 }
 
 MUTATING_TOOLS: frozenset[str] = frozenset({"terminal", "write_file", "patch", "browser_exec"})
+READ_ONLY_SCOUT_TOOLS: frozenset[str] = frozenset(
+    {"read_file", "search_files", "skills_list", "skill_view", "session_search", "web_search", "web_extract"}
+)
 
 
 def _extract_user_text(user_message: Any, max_chars: int) -> str:
@@ -79,13 +89,17 @@ def _tail_digest(conversation_history: list[Any] | None, max_chars: int = 800) -
     return digest
 
 
-def score_to_effort(score: float, effective_tier: CognitiveTier) -> str:
-    """Map a probability-weighted 0..3 score to Hermes's reasoning-effort ladder."""
-    clamped_idx = max(0, min(len(EFFORT_LADDER) - 1, round(score)))
-    effort = EFFORT_LADDER[clamped_idx]
-    if effective_tier == "system2" and effort == "minimal":
-        return "medium"
-    if effective_tier == "system1" and effort == "high":
+def score_to_effort(score: float, effective_tier: CognitiveTier, *, trap_risk_prob: float = 0.0) -> str:
+    """Map a probability-weighted 0..4 score onto Hermes's 5-rung precision effort ladder."""
+    if score >= 3.35 or (score >= 2.80 and trap_risk_prob >= 0.55):
+        effort = "xhigh"
+    else:
+        clamped_idx = max(0, min(len(EFFORT_LADDER) - 1, round(score)))
+        effort = EFFORT_LADDER[clamped_idx]
+
+    if effective_tier == "system2" and effort in ("minimal", "low"):
+        return "high" if trap_risk_prob >= 0.60 else "medium"
+    if effective_tier == "system1" and effort in ("high", "xhigh"):
         return "low"
     return effort
 
@@ -102,11 +116,17 @@ def run_turn_triage(
 ) -> TriageVerdict:
     """Run Stage 1 (Triage) in a single multi-question System-1 pass."""
     max_chars = int(ctx.get_config("max_excerpt_chars", default=2400) or 2400)
-    conf_threshold = float(ctx.get_config("confidence_threshold", default=0.65) or 0.65)
+    conf_threshold = float(ctx.get_config("confidence_threshold", default=0.82) or 0.82)
+    trap_threshold = float(ctx.get_config("trap_risk_threshold", default=0.30) or 0.30)
     err_cap = max(1, int(ctx.get_config("escalate_after_errors", default=2) or 2))
 
     err_streak = int(ctx.state.get(f"err_streak:{session_id}", default=0) or 0) if session_id else 0
     forced_s2 = bool(ctx.state.get(f"force_s2:{session_id}", default=False)) if session_id else False
+
+    # Reset per-turn step-pacing counters on fresh user turn entry
+    if session_id:
+        ctx.state.set(f"read_streak:{session_id}", 0)
+        ctx.state.set(f"last_phase:{session_id}", "turn_start")
 
     state_payload = {
         "user_message": _extract_user_text(user_message, max_chars),
@@ -121,13 +141,12 @@ def run_turn_triage(
     batch = backend.decide(state_payload, TURN_QUESTIONS)
 
     if not batch.ok:
-        # Fail-open conservatively to System 2 so a Foundry network blip never degrades reasoning
         return TriageVerdict(
             session_id=session_id,
             raw_tier="system2",
             effective_tier="system2",
-            effort_score=2.0,
-            effective_effort="high" if (err_streak >= err_cap or forced_s2) else "medium",
+            effort_score=2.5,
+            effective_effort="xhigh" if (err_streak >= err_cap or forced_s2) else "high",
             confidence=0.0,
             abstained=True,
             sticky_override=forced_s2,
@@ -142,23 +161,35 @@ def run_turn_triage(
 
     tier_ans = batch.answers.get("tier")
     effort_ans = batch.answers.get("effort")
+    trap_ans = batch.answers.get("trap_risk")
     plan_ans = batch.answers.get("needs_plan")
 
     raw_choice = tier_ans.choice if (tier_ans and tier_ans.choice in ("system1", "system2")) else "system2"
     raw_tier: CognitiveTier = "system1" if raw_choice == "system1" else "system2"
     top_conf = tier_ans.top_probability if tier_ans else 0.0
     effort_score = float(effort_ans.score) if (effort_ans and effort_ans.score is not None) else (
-        0.8 if raw_tier == "system1" else 2.2
+        0.8 if raw_tier == "system1" else 2.4
     )
+    trap_risk_prob = float(trap_ans.noul) if (trap_ans and trap_ans.noul is not None) else 0.0
     needs_plan_prob = float(plan_ans.noul) if (plan_ans and plan_ans.noul is not None) else 0.0
 
-    # Calibrated abstention: only downgrade to System 1 when confidence >= threshold
     abstained = False
+    trap_blocked = False
     effective_tier: CognitiveTier = raw_tier
+
+    # Asymmetric precision rules:
+    # 1. Require high confidence (>= 0.82 default) before lowering to System 1
     if raw_tier == "system1" and top_conf < conf_threshold:
         effective_tier = "system2"
         abstained = True
-    if effort_score >= 2.15 and effective_tier == "system1":
+
+    # 2. Hidden-trap veto: even if prompt looks short/routine, trap_risk >= 0.30 forces System 2
+    if trap_risk_prob >= trap_threshold and effective_tier == "system1":
+        effective_tier = "system2"
+        trap_blocked = True
+
+    # 3. Effort score floor
+    if effort_score >= 1.85 and effective_tier == "system1":
         effective_tier = "system2"
 
     error_override = err_streak >= err_cap
@@ -166,13 +197,12 @@ def run_turn_triage(
         effective_tier = "system2"
 
     effective_effort = (
-        "high"
+        "xhigh"
         if (error_override or forced_s2)
-        else score_to_effort(effort_score, effective_tier)
+        else score_to_effort(effort_score, effective_tier, trap_risk_prob=trap_risk_prob)
     )
 
     if session_id and forced_s2:
-        # One-turn explicit escalation consumed on turn entry (stays sticky within the turn)
         ctx.state.set(f"force_s2:{session_id}", False)
 
     return TriageVerdict(
@@ -190,6 +220,8 @@ def run_turn_triage(
         decision_model=batch.model,
         decision_latency_ms=batch.latency_ms,
         decision_input_tokens=batch.input_tokens,
+        trap_risk_prob=trap_risk_prob,
+        trap_blocked=trap_blocked,
     )
 
 

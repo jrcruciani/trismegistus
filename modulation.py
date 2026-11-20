@@ -1,4 +1,4 @@
-"""Stage 2 (Modulation) & Stage 3 (Execution): wire-safe request shaping and fail-open execution."""
+"""Stage 2 (Modulation) & Stage 3 (Execution): wire-safe request shaping, dynamic step pacing, and fail-open execution."""
 
 from __future__ import annotations
 
@@ -41,6 +41,32 @@ class TurnSessionRegistry:
             return self._verdicts.get(key)
 
 
+def _pace_effort_for_step(
+    base_effort: str,
+    *,
+    api_call_count: int,
+    last_phase: str,
+    read_streak: int,
+) -> tuple[str, bool]:
+    """Dynamic Intra-Turn Step Pacing:
+
+    - Call 1 (initial planning): full `base_effort` (`high` / `xhigh`).
+    - Intermediate calls immediately following clean read-only scout tools (`read_file`,
+      `search_files`, etc.): pace down (`xhigh` -> `medium`, `high`/`medium` -> `low`) to eliminate
+      5-12s of redundant hidden thinking per file read while keeping the exact same model and
+      100% warm KV cache.
+    - Calls following any mutation (`write_file`, `patch`), `terminal` execution, error, or
+      synthesis transition: immediately restore full `base_effort`.
+    """
+    if api_call_count <= 1 or last_phase != "scout" or read_streak < 1:
+        return base_effort, False
+    if base_effort in ("xhigh", "max"):
+        return "medium", True
+    if base_effort in ("high", "medium"):
+        return "low", True
+    return base_effort, False
+
+
 def modulate_llm_request(
     ctx: Any,
     registry: TurnSessionRegistry,
@@ -52,29 +78,42 @@ def modulate_llm_request(
     api_mode: str = "",
     api_call_count: int = 0,
 ) -> dict[str, Any] | None:
-    """Stage 2 (`llm_request` middleware): apply effort & wire-safe Copilot model selection."""
+    """Stage 2 (`llm_request` middleware): apply effort, step pacing, & wire-safe Copilot model selection."""
     verdict = registry.get(session_id)
     if verdict is None:
         return None
 
     mode = str(ctx.get_config("mode", default="shadow") or "shadow").strip()
     sticky_s2 = bool(ctx.get_config("sticky_system2_within_turn", default=True))
+    step_pacing = bool(ctx.get_config("step_pacing_enabled", default=True))
     err_cap = max(1, int(ctx.get_config("escalate_after_errors", default=2) or 2))
 
-    # Mid-turn metacognitive escalation: check if tool errors or explicit escalate tool fired
     err_streak = int(ctx.state.get(f"err_streak:{session_id}", default=0) or 0) if session_id else 0
     forced_s2 = bool(ctx.state.get(f"force_s2:{session_id}", default=False)) if session_id else False
+    last_phase = str(ctx.state.get(f"last_phase:{session_id}", default="turn_start") or "turn_start") if session_id else "turn_start"
+    read_streak = int(ctx.state.get(f"read_streak:{session_id}", default=0) or 0) if session_id else 0
+
+    verdict.step_paced = False
 
     if err_streak >= err_cap or forced_s2:
         verdict.effective_tier = "system2"
-        verdict.effective_effort = "high"
+        verdict.effective_effort = "xhigh"
         verdict.error_streak_override = err_streak >= err_cap
         verdict.sticky_override = verdict.sticky_override or forced_s2
         if session_id and forced_s2:
             ctx.state.set(f"force_s2:{session_id}", False)
     elif sticky_s2 and api_call_count > 1 and verdict.effective_tier == "system2":
-        # Never downgrade mid-turn once System 2 KV cache is warm
         verdict.sticky_override = True
+
+    step_effort = verdict.effective_effort
+    if step_pacing and err_streak == 0 and not forced_s2:
+        step_effort, paced = _pace_effort_for_step(
+            verdict.effective_effort,
+            api_call_count=api_call_count,
+            last_phase=last_phase,
+            read_streak=read_streak,
+        )
+        verdict.step_paced = paced
 
     active_provider = str(provider or "").strip().lower()
     current_model = str(request.get("model") or model or "").strip()
@@ -84,7 +123,6 @@ def modulate_llm_request(
         else "chat_completions"
     )
 
-    # Compute target model candidate (for shadow telemetry and tier_and_effort mode)
     cfg_s1 = str(ctx.get_config("system1_model", default="") or "").strip()
     cfg_s2 = str(ctx.get_config("system2_model", default="") or "").strip()
     if verdict.effective_tier == "system1":
@@ -105,11 +143,11 @@ def modulate_llm_request(
 
     if mode == "shadow":
         verdict.applied_model = current_model
-        verdict.applied_effort = f"shadow({verdict.effective_effort})"
+        verdict.applied_effort = f"shadow({step_effort})"
         return {
             "request": dict(request),
             "source": "trismegistus",
-            "reason": f"shadow:{verdict.summary_tag()} would_model={candidate_model}",
+            "reason": f"shadow:{verdict.summary_tag()} step_effort={step_effort} would_model={candidate_model}",
         }
 
     chosen_model = current_model
@@ -147,7 +185,7 @@ def modulate_llm_request(
 
     updated, applied_effort = apply_effort_to_request(
         updated,
-        effort=verdict.effective_effort,
+        effort=step_effort,
         effective_model=chosen_model or current_model,
         provider=active_provider,
         api_mode=effective_wire,
@@ -156,7 +194,7 @@ def modulate_llm_request(
     verdict.applied_model = chosen_model
     verdict.applied_effort = applied_effort or "native"
 
-    reason = f"{mode}:{verdict.summary_tag()} model={chosen_model}"
+    reason = f"{mode}:{verdict.summary_tag()} applied_effort={verdict.applied_effort} model={chosen_model}"
     if guard_note:
         reason = f"{reason} guard={guard_note}"
 
@@ -184,8 +222,6 @@ def execute_with_failopen(
     except Exception as exc:
         status = getattr(exc, "status_code", None)
         msg = str(exc).lower()
-        # If our swapped model isn't entitled on this Copilot seat (400/403/404 model_not_supported),
-        # retry transparently once with the session's original request kwargs!
         entitlement_err = status in (400, 403, 404, 422) or any(
             tok in msg for tok in ("model_not_supported", "model_not_found", "unsupported model", "does not exist")
         )

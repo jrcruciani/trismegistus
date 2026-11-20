@@ -1,4 +1,4 @@
-"""End-to-end tests for Trismegistus's 3-stage pipeline: Triage -> Modulation -> Call."""
+"""End-to-end tests for Trismegistus v0.2: Precision Trap Gate, Dynamic Step Pacing, Specialty Delegation & Ledger."""
 
 from __future__ import annotations
 
@@ -81,18 +81,18 @@ class _StubPluginContext:
 
 def test_full_three_stage_system1_downgrade_and_ledger(pkg):
     ctx = _StubPluginContext(
-        config={"mode": "tier_and_effort", "backend": "hermes_aux", "confidence_threshold": 0.65},
+        config={"mode": "tier_and_effort", "backend": "hermes_aux", "confidence_threshold": 0.82},
         scripted_decisions=[
             {
                 "tier": {"choice": "system1", "confidence": 0.94},
                 "effort": {"score": 0.2, "confidence": 0.91},
+                "trap_risk": {"noul": 0.04},
                 "needs_plan": {"noul": 0.05},
             }
         ],
     )
     pkg.register(ctx)
 
-    # Stage 1: Triage
     inject = ctx.hooks["pre_llm_call"](
         session_id="ses_1",
         user_message="Translate 'good morning' to Spanish",
@@ -102,7 +102,6 @@ def test_full_three_stage_system1_downgrade_and_ledger(pkg):
     )
     assert inject is None
 
-    # Stage 2: Modulation (Claude on Copilot -> claude-haiku-4.5, stale reasoning_effort stripped)
     mw_out = ctx.middleware["llm_request"](
         request={"model": "claude-sonnet-4.6", "reasoning_effort": "medium", "messages": [{"role": "user", "content": "hi"}]},
         session_id="ses_1",
@@ -115,7 +114,6 @@ def test_full_three_stage_system1_downgrade_and_ledger(pkg):
     assert mw_out["request"]["model"] == "claude-haiku-4.5"
     assert "reasoning_effort" not in mw_out["request"]
 
-    # Stage 3: Call + Ledger recording
     resp = ctx.middleware["llm_execution"](
         request=mw_out["request"],
         original_request={"model": "claude-sonnet-4.6"},
@@ -130,19 +128,128 @@ def test_full_three_stage_system1_downgrade_and_ledger(pkg):
     )
 
     stats_text = ctx.commands["trismegistus"]("stats", session_id="ses_1")
-    assert "System 1: 1" in stats_text
+    assert "S1: 1" in stats_text
     assert "claude-haiku-4.5" in stats_text
 
 
-def test_calibrated_abstention_keeps_system2_when_uncertain(pkg):
+def test_hidden_trap_gate_vetoes_false_system1_downgrade(pkg):
+    """Even when tier confidence is 0.91 for system1, trap_risk >= 0.30 blocks low effort!"""
     ctx = _StubPluginContext(
-        config={"mode": "tier_and_effort", "backend": "hermes_aux", "confidence_threshold": 0.70},
+        config={
+            "mode": "effort_only",
+            "backend": "hermes_aux",
+            "confidence_threshold": 0.82,
+            "trap_risk_threshold": 0.30,
+        },
         scripted_decisions=[
             {
-                # Model leans system1, but confidence 0.56 < 0.70 -> must abstain to System 2!
-                "tier": {"choice": "system1", "confidence": 0.56},
-                "effort": {"score": 1.4, "confidence": 0.55},
-                "needs_plan": {"noul": 0.40},
+                # Looks like a 1-line edit ("Change timeout from 5 to 30"), so tier=system1 (0.91),
+                # but trap_risk spots hidden state/concurrency coupling (0.64 >= 0.30)!
+                "tier": {"choice": "system1", "confidence": 0.91},
+                "effort": {"score": 1.1, "confidence": 0.85},
+                "trap_risk": {"noul": 0.64},
+                "needs_plan": {"noul": 0.35},
+            }
+        ],
+    )
+    pkg.register(ctx)
+    ctx.hooks["pre_llm_call"](
+        session_id="ses_trap",
+        user_message="Bump lock timeout from 5s to 30s in worker.py",
+        conversation_history=[],
+        model="gpt-5.4",
+        platform="cli",
+    )
+    mw_out = ctx.middleware["llm_request"](
+        request={"model": "gpt-5.4", "input": []},
+        session_id="ses_trap",
+        provider="copilot",
+        model="gpt-5.4",
+        api_mode="codex_responses",
+        api_call_count=1,
+    )
+    assert mw_out["request"]["model"] == "gpt-5.4"
+    # Trap risk >= 0.60 escalates floor directly to `high`!
+    assert mw_out["request"]["reasoning"]["effort"] == "high"
+    assert "trap_guard->s2" in mw_out["reason"]
+
+
+def test_dynamic_intra_turn_step_pacing_preserves_model_and_restores_xhigh(pkg):
+    """Step 1 plans at `xhigh`; read_file steps pace to `medium` for speed; patch restores `xhigh`!"""
+    ctx = _StubPluginContext(
+        config={"mode": "effort_only", "backend": "hermes_aux", "step_pacing_enabled": True},
+        scripted_decisions=[
+            {
+                "tier": {"choice": "system2", "confidence": 0.98},
+                "effort": {"score": 3.8, "confidence": 0.95},
+                "trap_risk": {"noul": 0.72},
+                "needs_plan": {"noul": 0.88},
+            }
+        ],
+    )
+    pkg.register(ctx)
+    ctx.hooks["pre_llm_call"](
+        session_id="ses_pace",
+        user_message="Find and fix the deadlock in connection pool checkout",
+        conversation_history=[],
+        model="gpt-5.4",
+        platform="cli",
+    )
+
+    # Call 1 (initial planning): full `xhigh`!
+    c1 = ctx.middleware["llm_request"](
+        request={"model": "gpt-5.4", "input": []},
+        session_id="ses_pace",
+        provider="copilot",
+        model="gpt-5.4",
+        api_mode="codex_responses",
+        api_call_count=1,
+    )
+    assert c1["request"]["reasoning"]["effort"] == "xhigh"
+    assert "step_paced" not in c1["reason"]
+
+    # Agent calls read_file cleanly -> scout phase
+    ctx.hooks["post_tool_call"](tool_name="read_file", result="1|class Pool: ...", status="ok", session_id="ses_pace")
+
+    # Call 2 (after read_file): paced down to `medium` on same `gpt-5.4` (100% warm KV cache!)
+    c2 = ctx.middleware["llm_request"](
+        request={"model": "gpt-5.4", "input": []},
+        session_id="ses_pace",
+        provider="copilot",
+        model="gpt-5.4",
+        api_mode="codex_responses",
+        api_call_count=2,
+    )
+    assert c2["request"]["model"] == "gpt-5.4"
+    assert c2["request"]["reasoning"]["effort"] == "medium"
+    assert "step_paced" in c2["reason"]
+
+    # Agent edits code via `patch` -> verify_or_act phase
+    ctx.hooks["post_tool_call"](tool_name="patch", result='{"success": true}', status="ok", session_id="ses_pace")
+
+    # Call 3 (after mutation): immediately restores full `xhigh` precision!
+    c3 = ctx.middleware["llm_request"](
+        request={"model": "gpt-5.4", "input": []},
+        session_id="ses_pace",
+        provider="copilot",
+        model="gpt-5.4",
+        api_mode="codex_responses",
+        api_call_count=3,
+    )
+    assert c3["request"]["reasoning"]["effort"] == "xhigh"
+    assert "step_paced" not in c3["reason"]
+
+
+def test_calibrated_abstention_keeps_system2_when_below_precision_floor(pkg):
+    ctx = _StubPluginContext(
+        config={"mode": "tier_and_effort", "backend": "hermes_aux", "confidence_threshold": 0.82},
+        scripted_decisions=[
+            {
+                # Confidence 0.74 < 0.82 precision floor -> must abstain upward to System 2!
+                "tier": {"choice": "system1", "confidence": 0.74},
+                "effort": {"score": 1.2, "confidence": 0.70},
+                "trap_risk": {"noul": 0.15},
+                "needs_plan": {"noul": 0.25},
             }
         ],
     )
@@ -166,13 +273,14 @@ def test_calibrated_abstention_keeps_system2_when_uncertain(pkg):
     assert "abstained->s2" in mw_out["reason"]
 
 
-def test_tool_error_streak_and_explicit_escalate_promote_to_system2(pkg):
+def test_tool_error_streak_promotes_to_system2_xhigh(pkg):
     ctx = _StubPluginContext(
         config={"mode": "tier_and_effort", "backend": "hermes_aux", "escalate_after_errors": 2},
         scripted_decisions=[
             {
-                "tier": {"choice": "system1", "confidence": 0.92},
+                "tier": {"choice": "system1", "confidence": 0.95},
                 "effort": {"score": 0.3, "confidence": 0.90},
+                "trap_risk": {"noul": 0.05},
                 "needs_plan": {"noul": 0.05},
             }
         ],
@@ -185,7 +293,6 @@ def test_tool_error_streak_and_explicit_escalate_promote_to_system2(pkg):
         model="gpt-5.4",
         platform="cli",
     )
-    # Iteration 1 uses gpt-5.4-mini (System 1)
     first = ctx.middleware["llm_request"](
         request={"model": "gpt-5.4", "input": []},
         session_id="ses_err",
@@ -196,11 +303,9 @@ def test_tool_error_streak_and_explicit_escalate_promote_to_system2(pkg):
     )
     assert first["request"]["model"] == "gpt-5.4-mini"
 
-    # Two consecutive tool errors happen mid-turn
-    ctx.hooks["post_tool_call"](result='{"error": "exit 1"}', status="error", session_id="ses_err")
-    ctx.hooks["post_tool_call"](result='{"error": "exit 2"}', status="error", session_id="ses_err")
+    ctx.hooks["post_tool_call"](tool_name="terminal", result='{"error": "exit 1"}', status="error", session_id="ses_err")
+    ctx.hooks["post_tool_call"](tool_name="terminal", result='{"error": "exit 2"}', status="error", session_id="ses_err")
 
-    # Iteration 2 automatically escalates back to System 2 (gpt-5.4, high effort)!
     second = ctx.middleware["llm_request"](
         request={"model": "gpt-5.4", "input": []},
         session_id="ses_err",
@@ -210,7 +315,7 @@ def test_tool_error_streak_and_explicit_escalate_promote_to_system2(pkg):
         api_call_count=2,
     )
     assert second["request"]["model"] == "gpt-5.4"
-    assert second["request"]["reasoning"]["effort"] == "high"
+    assert second["request"]["reasoning"]["effort"] == "xhigh"
     assert "err_streak->s2" in second["reason"]
 
 
@@ -235,40 +340,70 @@ def test_llm_execution_fails_open_on_unentitled_copilot_model(pkg):
     assert out["model"] == "claude-sonnet-4.6"
 
 
-def test_delegation_provider_routes_across_copilot_models(pkg):
+def test_specialty_delegation_provider_routes_four_cognitive_lanes(pkg):
     ctx = _StubPluginContext(
         config={
             "backend": "hermes_aux",
             "delegation_provider": "copilot",
-            "delegation_system1_model": "claude-haiku-4.5",
-            "delegation_system2_model": "gpt-5.4",
+            "confidence_threshold": 0.82,
         },
         scripted_decisions=[
-            {"tier": {"choice": "system1", "confidence": 0.91}},
-            {"tier": {"choice": "system2", "confidence": 0.96}},
+            {"specialty": {"choice": "fast_scout", "confidence": 0.93}},
+            {"specialty": {"choice": "deep_code", "confidence": 0.96}},
+            {"specialty": {"choice": "architecture", "confidence": 0.91}},
+            {"specialty": {"choice": "long_context", "confidence": 0.89}},
+            # Uncertain fast_scout (0.68 < 0.82) -> asymmetric guard upgrades to deep_code!
+            {"specialty": {"choice": "fast_scout", "confidence": 0.68}},
         ],
     )
     pkg.register(ctx)
     dp = ctx.delegation_provider
     assert dp is not None and dp.name == "trismegistus"
 
-    r1 = dp.route_task({"goal": "Count lines in docs/"}, {})
-    assert r1 == {"provider": "copilot", "model": "claude-haiku-4.5", "label": "trismegistus:system1"}
+    r_scout = dp.route_task({"goal": "List all YAML files under config/"}, {})
+    assert r_scout == {
+        "provider": "copilot",
+        "model": "gemini-3-flash-preview",
+        "label": "trismegistus:fast_scout",
+    }
 
-    r2 = dp.route_task({"goal": "Design lock-free ring buffer and prove memory ordering"}, {})
-    assert r2["provider"] == "copilot"
-    assert r2["model"] == "gpt-5.4"
-    assert r2["reasoning_effort"] == "high"
+    r_code = dp.route_task({"goal": "Prove lock-free ring buffer memory ordering and fix ABA bug"}, {})
+    assert r_code == {
+        "provider": "copilot",
+        "model": "gpt-5.4",
+        "label": "trismegistus:deep_code",
+        "reasoning_effort": "xhigh",
+    }
+
+    r_arch = dp.route_task({"goal": "Review plugin boundary contracts across 6 modules"}, {})
+    assert r_arch == {
+        "provider": "copilot",
+        "model": "claude-sonnet-5",
+        "label": "trismegistus:architecture",
+        "reasoning_effort": "high",
+    }
+
+    r_long = dp.route_task({"goal": "Cross-reference 40k lines of crash logs against docs"}, {})
+    assert r_long == {
+        "provider": "copilot",
+        "model": "gemini-3.1-pro-preview",
+        "label": "trismegistus:long_context",
+        "reasoning_effort": "high",
+    }
+
+    r_guarded = dp.route_task({"goal": "Check subtle auth middleware"}, {})
+    assert r_guarded["model"] == "gpt-5.4"
+    assert r_guarded["reasoning_effort"] == "xhigh"
 
 
-def test_tool_risk_gate_and_verify_gate_and_tools(pkg):
+def test_tool_risk_gate_default_verify_gate_and_tools(pkg):
+    # Note: verify_gate_enabled is NOT passed here — testing that its new v0.2 default is True!
     ctx = _StubPluginContext(
         config={
             "mode": "effort_only",
             "backend": "hermes_aux",
             "tool_gate_enabled": True,
             "tool_risk_threshold": 0.80,
-            "verify_gate_enabled": True,
         },
         scripted_decisions=[
             {"high_risk": {"noul": 0.92}},
@@ -278,7 +413,6 @@ def test_tool_risk_gate_and_verify_gate_and_tools(pkg):
     )
     pkg.register(ctx)
 
-    # 1. pre_tool_call escalates risky mutating tool to human approval
     gate = ctx.hooks["pre_tool_call"](
         tool_name="terminal",
         args={"command": "rm -rf /var/lib/prod-data"},
@@ -286,7 +420,6 @@ def test_tool_risk_gate_and_verify_gate_and_tools(pkg):
     assert gate is not None
     assert gate["action"] == "approve"
 
-    # 2. pre_verify nudges agent when code changed without verification evidence
     verify_nudge = ctx.hooks["pre_verify"](
         coding=True,
         attempt=0,
@@ -296,7 +429,6 @@ def test_tool_risk_gate_and_verify_gate_and_tools(pkg):
     assert verify_nudge is not None
     assert verify_nudge["action"] == "continue"
 
-    # 3. Direct trismegistus_decide tool invocation
     decide_raw = ctx.tools["trismegistus_decide"]["handler"](
         {
             "state": "Database migration touches auth schema",
@@ -309,9 +441,9 @@ def test_tool_risk_gate_and_verify_gate_and_tools(pkg):
     assert decide_out["ok"] is True
     assert decide_out["answer"]["choice"] == "system2"
 
-    # 4. Direct trismegistus_escalate tool invocation
     esc_raw = ctx.tools["trismegistus_escalate"]["handler"](
         {"reason": "Found subtle race condition"}, session_id="ses_tools"
     )
-    assert json.loads(esc_raw)["escalated_to"] == "system2"
-
+    esc_out = json.loads(esc_raw)
+    assert esc_out["escalated_to"] == "system2"
+    assert esc_out["effective_effort"] == "xhigh"

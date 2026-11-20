@@ -1,4 +1,4 @@
-"""Tests for GitHub Copilot wire-mode safety, effort clamping, and replay-carrier guards."""
+"""Tests for GitHub Copilot wire-mode safety, xhigh/max effort unlocking, and replay-carrier guards."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ def test_copilot_api_mode_classification(pkg):
     assert infer("gpt-5.4") == "codex_responses"
     assert infer("gpt-5.4-mini") == "codex_responses"
     assert infer("gpt-5.3-codex") == "codex_responses"
+    assert infer("gpt-6-astra") == "codex_responses"
     assert infer("mai-code-2") == "codex_responses"
     assert infer("grok-4") == "codex_responses"
     # Chat Completions wire on Copilot
@@ -23,7 +24,6 @@ def test_copilot_api_mode_classification(pkg):
 
 def test_wire_mismatch_blocks_unsafe_copilot_swap(pkg):
     can_swap = pkg.copilot_lanes.can_safely_swap_model
-    # Session started on Claude (chat_completions) cannot swap in-place to gpt-5.4 (codex_responses)
     ok, why = can_swap(
         provider="copilot",
         api_mode="chat_completions",
@@ -34,7 +34,6 @@ def test_wire_mismatch_blocks_unsafe_copilot_swap(pkg):
     assert not ok
     assert "wire_mismatch" in why
 
-    # Same wire (`claude-sonnet-4.6` -> `claude-haiku-4.5`) is safe
     ok2, _ = can_swap(
         provider="copilot",
         api_mode="chat_completions",
@@ -44,7 +43,6 @@ def test_wire_mismatch_blocks_unsafe_copilot_swap(pkg):
     )
     assert ok2
 
-    # Same wire on codex_responses (`gpt-5.4` -> `gpt-5.4-mini`) is safe
     ok3, _ = can_swap(
         provider="copilot",
         api_mode="codex_responses",
@@ -87,7 +85,7 @@ def test_gemini_thought_signature_carrier_blocks_mid_session_swap(pkg):
     assert "thought_signature" in why
 
 
-def test_effort_encoding_and_stripping_per_model_and_wire(pkg):
+def test_effort_encoding_xhigh_unlocking_and_responses_minimal_clamp(pkg):
     apply_eff = pkg.copilot_lanes.apply_effort_to_request
 
     # 1. Downgrading to claude-haiku-4.5 (non-reasoning) MUST strip stale reasoning_effort
@@ -101,25 +99,56 @@ def test_effort_encoding_and_stripping_per_model_and_wire(pkg):
     assert "reasoning_effort" not in updated
     assert eff is None
 
-    # 2. Gemini 4 Carbon clamps 'minimal' -> 'low' on chat_completions
-    updated_gem, eff_gem = apply_eff(
+    # 2. Gemini 4 Carbon clamps 'xhigh' -> 'high' and 'minimal' -> 'low' on chat_completions
+    updated_gem_hi, eff_gem_hi = apply_eff(
+        {"model": "gemini-4-carbon", "messages": []},
+        effort="xhigh",
+        effective_model="gemini-4-carbon",
+        provider="copilot",
+        api_mode="chat_completions",
+    )
+    assert updated_gem_hi["reasoning_effort"] == "high"
+    assert eff_gem_hi == "high"
+
+    updated_gem_lo, eff_gem_lo = apply_eff(
         {"model": "gemini-4-carbon", "messages": []},
         effort="minimal",
         effective_model="gemini-4-carbon",
         provider="copilot",
         api_mode="chat_completions",
     )
-    assert updated_gem["reasoning_effort"] == "low"
-    assert eff_gem == "low"
+    assert updated_gem_lo["reasoning_effort"] == "low"
+    assert eff_gem_lo == "low"
 
-    # 3. GPT-5.4 on codex_responses writes nested `reasoning: {effort, summary: 'auto'}`
-    updated_codex, eff_codex = apply_eff(
+    # 3. GPT-5.4 on codex_responses unlocks `xhigh`, AND clamps `minimal` -> `low` (never `none`!)
+    updated_codex_xh, eff_codex_xh = apply_eff(
         {"model": "gpt-5.4", "input": []},
-        effort="high",
+        effort="xhigh",
         effective_model="gpt-5.4",
         provider="copilot",
         api_mode="codex_responses",
     )
-    assert updated_codex["reasoning"] == {"effort": "high", "summary": "auto"}
-    assert "reasoning_effort" not in updated_codex
-    assert eff_codex == "high"
+    assert updated_codex_xh["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+    assert "reasoning_effort" not in updated_codex_xh
+    assert eff_codex_xh == "xhigh"
+
+    updated_codex_min, eff_codex_min = apply_eff(
+        {"model": "gpt-5.4", "input": []},
+        effort="minimal",
+        effective_model="gpt-5.4",
+        provider="copilot",
+        api_mode="codex_responses",
+    )
+    assert updated_codex_min["reasoning"]["effort"] == "low"
+    assert eff_codex_min == "low"
+
+    # 4. Claude Sonnet 5 on chat_completions unlocks `xhigh` natively
+    updated_c5, eff_c5 = apply_eff(
+        {"model": "claude-sonnet-5", "messages": []},
+        effort="xhigh",
+        effective_model="claude-sonnet-5",
+        provider="copilot",
+        api_mode="chat_completions",
+    )
+    assert updated_c5["reasoning_effort"] == "xhigh"
+    assert eff_c5 == "xhigh"

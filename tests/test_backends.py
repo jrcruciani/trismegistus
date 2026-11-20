@@ -1,7 +1,8 @@
-"""Tests for System-1 decision backends (Foundry SystemOne, Local Logprobs, Hermes Aux)."""
+"""Tests for System-1 decision backends, Keep-Alive TLS pooling, and Logprobs calibration."""
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import urllib.error
@@ -35,6 +36,42 @@ class _RecordingOpener:
         return nxt
 
 
+class _FakeKeepAliveConn:
+    """Simulates http.client.HTTPSConnection with socket reuse & stale disconnect recovery."""
+
+    def __init__(self, scripted_events: list):
+        self.scripted_events = scripted_events
+        self.sock = object()
+        self.timeout = 1.2
+        self.requests: list[tuple[str, str, bytes, dict]] = []
+        self.closed = False
+
+    def request(self, method: str, target: str, body: bytes = b"", headers: dict | None = None):
+        self.requests.append((method, target, body, dict(headers or {})))
+        evt = self.scripted_events.pop(0)
+        if isinstance(evt, Exception):
+            raise evt
+        self._next_resp = evt
+
+    def getresponse(self):
+        return self._next_resp
+
+    def close(self):
+        self.closed = True
+        self.sock = None
+
+
+class _FakeLowLevelResp:
+    def __init__(self, payload: dict, status: int = 200, conn_header: str = "keep-alive"):
+        self.status = status
+        self.reason = "OK" if status < 400 else "Error"
+        self.headers = {"Connection": conn_header}
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+
 def test_foundry_url_normalization(pkg):
     norm = pkg.backends.normalize_foundry_systemone_url
     assert (
@@ -49,6 +86,45 @@ def test_foundry_url_normalization(pkg):
         norm("https://demo-foundry.services.ai.azure.com/providers/microsoft/v1/systemone")
         == "https://demo-foundry.services.ai.azure.com/providers/microsoft/v1/systemone"
     )
+
+
+def test_keepalive_pool_reuses_warm_socket_and_recovers_stale_disconnect(pkg):
+    created_conns: list[_FakeKeepAliveConn] = []
+    # Conn 1 serves call #1, then raises RemoteDisconnected on call #2 (stale idle socket).
+    # Pool must transparently discard Conn 1 and retry call #2 on fresh Conn 2!
+    conn1 = _FakeKeepAliveConn(
+        [
+            _FakeLowLevelResp({"ok": 1}),
+            http.client.RemoteDisconnected("Remote end closed connection without response"),
+        ]
+    )
+    conn2 = _FakeKeepAliveConn([_FakeLowLevelResp({"ok": 2}), _FakeLowLevelResp({"ok": 3})])
+    queue = [conn1, conn2]
+
+    def factory(_scheme, _host, _port, timeout):
+        c = queue.pop(0)
+        c.timeout = timeout
+        created_conns.append(c)
+        return c
+
+    pool = pkg.compat.KeepAliveHttpPool(connection_factory=factory)
+    url = "https://demo-foundry.services.ai.azure.com/providers/microsoft/v1/systemone"
+
+    r1 = json.loads(pool.post_bytes(url, b"{}", {"api-key": "k"}, timeout=1.2).read())
+    assert r1 == {"ok": 1}
+    assert len(created_conns) == 1
+
+    # Second call hits stale conn1 -> transparently retries on conn2
+    r2 = json.loads(pool.post_bytes(url, b"{}", {"api-key": "k"}, timeout=1.2).read())
+    assert r2 == {"ok": 2}
+    assert conn1.closed is True
+    assert len(created_conns) == 2
+
+    # Third call reuses warm conn2 with zero new socket creation!
+    r3 = json.loads(pool.post_bytes(url, b"{}", {"api-key": "k"}, timeout=1.2).read())
+    assert r3 == {"ok": 3}
+    assert len(created_conns) == 2
+    assert len(conn2.requests) == 2
 
 
 def test_foundry_systemone_request_headers_and_multi_question_parse(pkg):
@@ -69,9 +145,9 @@ def test_foundry_systemone_request_headers_and_multi_question_parse(pkg):
                             "type": "score",
                             "score": 0.42,
                             "confidence": 0.88,
-                            "probabilities": {"0": 0.62, "1": 0.34, "2": 0.04, "3": 0.0},
+                            "probabilities": {"0": 0.62, "1": 0.34, "2": 0.04, "3": 0.0, "4": 0.0},
                         },
-                        "risky": {
+                        "trap_risk": {
                             "type": "noul",
                             "noul": 0.08,
                         },
@@ -84,7 +160,7 @@ def test_foundry_systemone_request_headers_and_multi_question_parse(pkg):
 
     client = pkg.backends.SystemOneHttpBackend(
         url="https://demo-foundry.services.ai.azure.com/providers/microsoft/v1/systemone",
-        model="pi-decision-1.1",
+        model="microsoft-decision-1.1",
         api_key="test-credential-placeholder",
         auth_mode="api-key",
         opener_factory=lambda _handler: opener,
@@ -93,8 +169,8 @@ def test_foundry_systemone_request_headers_and_multi_question_parse(pkg):
         {"msg": "Format this date as ISO-8601"},
         {
             "tier": DQ.choice("Pick tier", {"system1": "fast", "system2": "deep"}),
-            "effort": DQ.score("Effort", ["Minimal", "Low", "Medium", "High"]),
-            "risky": DQ.noul("Is this risky?"),
+            "effort": DQ.score("Effort", ["Minimal", "Low", "Medium", "High", "XHigh"]),
+            "trap_risk": DQ.noul("Hidden trap?"),
         },
     )
 
@@ -104,11 +180,10 @@ def test_foundry_systemone_request_headers_and_multi_question_parse(pkg):
     assert res.answers["tier"].choice == "system1"
     assert abs(res.answers["tier"].top_probability - 0.93) < 1e-6
     assert abs(res.answers["effort"].score - 0.42) < 1e-6
-    assert abs(res.answers["risky"].noul - 0.08) < 1e-6
+    assert abs(res.answers["trap_risk"].noul - 0.08) < 1e-6
 
     sent_req, _timeout = opener.requests[0]
     headers_lower = {k.lower(): v for k, v in sent_req.header_items()}
-    # Foundry gateway requires Content-Length on POST /v1/systemone
     assert int(headers_lower["content-length"]) == len(sent_req.data)
     assert headers_lower["api-key"] == "test-credential-placeholder"
 
@@ -136,7 +211,7 @@ def test_foundry_429_retry_after_ms(pkg):
     )
     client = pkg.backends.SystemOneHttpBackend(
         url="https://demo.example/providers/microsoft/v1/systemone",
-        model="decision-1.1",
+        model="microsoft-decision-1.1",
         api_key="test-credential-placeholder",
         max_attempts=2,
         opener_factory=lambda _handler: opener,
@@ -160,10 +235,10 @@ def test_local_logits_softmax_calibration(pkg):
                                 "content": [
                                     {
                                         "token": "B",
-                                        "logprob": -0.10536,  # ~0.90
+                                        "logprob": -0.10536,
                                         "top_logprobs": [
                                             {"token": "B", "logprob": -0.10536},
-                                            {"token": "A", "logprob": -2.30258},  # ~0.10
+                                            {"token": "A", "logprob": -2.30258},
                                         ],
                                     }
                                 ]

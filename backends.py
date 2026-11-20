@@ -1,16 +1,15 @@
 """System-1 decision backends for Trismegistus:
 
-1. `FoundrySystemOneBackend` (`foundry_systemone` / `local_systemone`):
+1. `SystemOneHttpBackend` (`foundry_systemone` / `local_systemone`):
    Speaks the native System One HTTP protocol (`POST .../providers/microsoft/v1/systemone` on
-   Microsoft Foundry for `Microsoft-Decision-1.1`, or `.../v1/systemone` for `open-jev` / Jev).
-   Sends explicit `Content-Length` (required by Foundry gateway) and handles `retry-after-ms`.
+   Microsoft Foundry for `Microsoft-Decision-1.1`, or `.../v1/systemone` for `open-jev`).
+   Uses persistent TLS Keep-Alive connections by default, sends explicit `Content-Length`, and
+   handles Foundry's `retry-after-ms`.
 2. `LocalLogitsBackend` (`local_logits`):
    Calls any local OpenAI-compatible inference engine (`llama-server`, `vLLM`, `Ollama`) with
-   `max_tokens=1, logprobs=True, top_logprobs=10, temperature=0.0` to extract calibrated
-   single-token softmax probabilities without prose generation.
+   `max_tokens=1, logprobs=True, top_logprobs=10, temperature=0.0` for calibrated softmax probabilities.
 3. `HermesAuxBackend` (`hermes_aux`):
-   Uses Hermes's host-owned `ctx.llm.complete_structured` on the plugin's registered
-   `trismegistus_decider` auxiliary task slot.
+   Uses Hermes's host-owned `ctx.llm.complete_structured` on `auxiliary.trismegistus_decider`.
 """
 
 from __future__ import annotations
@@ -35,7 +34,6 @@ def normalize_foundry_systemone_url(endpoint: str) -> str:
         return raw
     if raw.endswith("/providers/microsoft"):
         return f"{raw}/v1/systemone"
-    # Strip accidental `/openai` or `/models` suffixes pasted from other Foundry blades
     for suffix in ("/openai/v1", "/openai", "/models"):
         if raw.endswith(suffix):
             raw = raw[: -len(suffix)].rstrip("/")
@@ -189,8 +187,9 @@ class SystemOneHttpBackend:
         api_key: str = "",
         auth_mode: str = "api-key",
         backend_name: str = "foundry_systemone",
-        timeout: float = 4.0,
+        timeout: float = 1.2,
         max_attempts: int = 2,
+        keep_alive: bool = True,
         opener_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.url = url
@@ -198,8 +197,9 @@ class SystemOneHttpBackend:
         self.api_key = api_key
         self.auth_mode = auth_mode
         self.backend_name = backend_name
-        self.timeout = max(0.5, float(timeout))
+        self.timeout = max(0.3, float(timeout))
         self.max_attempts = max(1, int(max_attempts))
+        self.keep_alive = bool(keep_alive)
         self.opener_factory = opener_factory
 
     def decide(
@@ -253,7 +253,10 @@ class SystemOneHttpBackend:
             )
             try:
                 with open_safe_url(
-                    req, timeout=self.timeout, opener_factory=self.opener_factory
+                    req,
+                    timeout=self.timeout,
+                    opener_factory=self.opener_factory,
+                    keep_alive=self.keep_alive,
                 ) as resp:
                     raw = resp.read()
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -272,8 +275,8 @@ class SystemOneHttpBackend:
                 except Exception:
                     pass
                 if exc.code == 429 and attempt < self.max_attempts:
-                    wait_s = parse_retry_after(exc.headers) or 0.25
-                    if wait_s <= max(0.5, self.timeout * 0.5):
+                    wait_s = parse_retry_after(exc.headers) or 0.15
+                    if wait_s <= max(0.3, self.timeout * 0.5):
                         time.sleep(wait_s)
                         continue
                 last_error = f"HTTP {exc.code}: {err_body or exc.reason}"
@@ -321,13 +324,15 @@ class LocalLogitsBackend:
         url: str,
         model: str,
         api_key: str = "",
-        timeout: float = 4.0,
+        timeout: float = 1.2,
+        keep_alive: bool = True,
         opener_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.url = normalize_chat_completions_url(url)
         self.model = model
         self.api_key = api_key
-        self.timeout = max(0.5, float(timeout))
+        self.timeout = max(0.3, float(timeout))
+        self.keep_alive = bool(keep_alive)
         self.opener_factory = opener_factory
 
     def _ask_one(self, state_json: str, q: DecisionQuestion) -> tuple[DecisionAnswer | None, int, str | None]:
@@ -383,7 +388,12 @@ class LocalLogitsBackend:
 
         req = urllib.request.Request(self.url, data=body_bytes, headers=headers, method="POST")
         try:
-            with open_safe_url(req, timeout=self.timeout, opener_factory=self.opener_factory) as resp:
+            with open_safe_url(
+                req,
+                timeout=self.timeout,
+                opener_factory=self.opener_factory,
+                keep_alive=self.keep_alive,
+            ) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             return None, 0, str(exc)
@@ -401,7 +411,6 @@ class LocalLogitsBackend:
             first_char = raw_text[:1]
             mapped = label_map.get(raw_text) or label_map.get(first_char)
             if mapped:
-                # Server did not return logprobs; assign neutral uncalibrated confidence
                 probs = {mapped: 0.70}
 
         in_tok = int(((payload.get("usage") or {}).get("prompt_tokens")) or 0)
@@ -433,7 +442,6 @@ class LocalLogitsBackend:
                 in_tok,
                 None,
             )
-        # score
         expected = sum(int(k) * v for k, v in probs.items() if k.isdigit())
         top_p = max(probs.values())
         return (
@@ -479,9 +487,9 @@ class LocalLogitsBackend:
 class HermesAuxBackend:
     """Zero-config fallback using `ctx.llm.complete_structured` on `trismegistus_decider`."""
 
-    def __init__(self, ctx: Any, *, timeout: float = 4.0) -> None:
+    def __init__(self, ctx: Any, *, timeout: float = 2.0) -> None:
         self.ctx = ctx
-        self.timeout = max(1.0, float(timeout))
+        self.timeout = max(0.8, float(timeout))
 
     def decide(
         self,
@@ -587,11 +595,15 @@ class HermesAuxBackend:
 def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | None = None):
     """Instantiate the active System-1 backend from `ctx.get_config(...)`."""
     kind = str(ctx.get_config("backend", default="foundry_systemone") or "foundry_systemone").strip()
-    timeout = float(ctx.get_config("timeout_seconds", default=4.0) or 4.0)
+    timeout = float(ctx.get_config("timeout_seconds", default=1.2) or 1.2)
+    keep_alive = bool(ctx.get_config("keep_alive_enabled", default=True))
 
     if kind == "foundry_systemone":
         endpoint = str(ctx.get_config("foundry_endpoint", default="") or "").strip()
-        deployment = str(ctx.get_config("foundry_deployment", default="microsoft-decision-1.1") or "microsoft-decision-1.1").strip()
+        deployment = str(
+            ctx.get_config("foundry_deployment", default="microsoft-decision-1.1")
+            or "microsoft-decision-1.1"
+        ).strip()
         auth_mode = str(ctx.get_config("foundry_auth_header", default="api-key") or "api-key").strip()
         api_key = read_secret("TRISMEGISTUS_FOUNDRY_API_KEY")
         return SystemOneHttpBackend(
@@ -601,6 +613,7 @@ def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | Non
             auth_mode=auth_mode,
             backend_name="foundry_systemone",
             timeout=timeout,
+            keep_alive=keep_alive,
             opener_factory=opener_factory,
         )
 
@@ -615,6 +628,7 @@ def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | Non
             auth_mode="bearer",
             backend_name="local_systemone",
             timeout=timeout,
+            keep_alive=keep_alive,
             opener_factory=opener_factory,
         )
 
@@ -627,6 +641,7 @@ def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | Non
             model=model,
             api_key=api_key,
             timeout=timeout,
+            keep_alive=keep_alive,
             opener_factory=opener_factory,
         )
 

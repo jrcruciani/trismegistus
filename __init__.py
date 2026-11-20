@@ -24,7 +24,13 @@ from .contracts import DecisionQuestion
 from .delegation import TrismegistusDelegationProvider
 from .ledger import handle_slash_command, record_turn_completion
 from .modulation import TurnSessionRegistry, execute_with_failopen, modulate_llm_request
-from .triage import MUTATING_TOOLS, evaluate_tool_risk, evaluate_verify_gate, run_turn_triage
+from .triage import (
+    MUTATING_TOOLS,
+    READ_ONLY_SCOUT_TOOLS,
+    evaluate_tool_risk,
+    evaluate_verify_gate,
+    run_turn_triage,
+)
 
 DECIDE_TOOL_SCHEMA: dict[str, Any] = {
     "name": "trismegistus_decide",
@@ -179,13 +185,13 @@ def register(ctx: Any) -> None:
         verdict = registry.get(session_id)
         if verdict is not None:
             verdict.effective_tier = "system2"
-            verdict.effective_effort = "high"
+            verdict.effective_effort = "xhigh"
             verdict.sticky_override = True
         return json.dumps(
             {
                 "ok": True,
                 "escalated_to": "system2",
-                "effective_effort": "high",
+                "effective_effort": "xhigh",
                 "reason": reason,
             }
         )
@@ -253,6 +259,7 @@ def register(ctx: Any) -> None:
         return None
 
     def on_post_tool_call(
+        tool_name: str = "",
         result: str = "",
         status: str = "",
         session_id: str = "",
@@ -261,11 +268,27 @@ def register(ctx: Any) -> None:
         del kwargs
         if not session_id:
             return
-        key = f"err_streak:{session_id}"
+        err_key = f"err_streak:{session_id}"
+        read_key = f"read_streak:{session_id}"
+        phase_key = f"last_phase:{session_id}"
+
         head = str(result or "")[:500]
         is_error = status == "error" or '"error":' in head or '"success": false' in head.lower()
-        current = int(ctx.state.get(key, default=0) or 0)
-        ctx.state.set(key, (current + 1) if is_error else 0)
+        current_err = int(ctx.state.get(err_key, default=0) or 0)
+        if is_error:
+            ctx.state.set(err_key, current_err + 1)
+            ctx.state.set(read_key, 0)
+            ctx.state.set(phase_key, "verify_or_act")
+            return
+
+        ctx.state.set(err_key, 0)
+        if tool_name in READ_ONLY_SCOUT_TOOLS:
+            cur_reads = int(ctx.state.get(read_key, default=0) or 0)
+            ctx.state.set(read_key, cur_reads + 1)
+            ctx.state.set(phase_key, "scout")
+        else:
+            ctx.state.set(read_key, 0)
+            ctx.state.set(phase_key, "verify_or_act")
 
     def on_pre_verify(
         coding: bool = False,
@@ -277,7 +300,7 @@ def register(ctx: Any) -> None:
         del kwargs
         if attempt > 0 or not coding or not changed_paths:
             return None
-        if not bool(ctx.get_config("verify_gate_enabled", default=False)):
+        if not bool(ctx.get_config("verify_gate_enabled", default=True)):
             return None
         if str(ctx.get_config("mode", default="shadow")) == "shadow":
             return None

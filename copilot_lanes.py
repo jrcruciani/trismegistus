@@ -1,15 +1,15 @@
 """GitHub Copilot wire-mode, reasoning-effort clamping, and System-1/System-2 lane pairs.
 
-Derived from Hermes's `github-copilot` provider profile:
-- `codex_responses` (`/responses`): GPT-5+ except `gpt-5-mini`, `mai-code-*`, `grok-*`.
-  Reasoning payload lives at `request["reasoning"] = {"effort": ..., "summary": "auto"}`.
-- `chat_completions` (`/chat/completions`): `gpt-5-mini`, `gpt-4.1`, `gpt-4o*`,
-  `claude-*`, `gemini-*`. Reasoning lives at top-level `request["reasoning_effort"]` ONLY
-  for models that advertise reasoning support; non-reasoning models reject the field (400).
+Aligned with Hermes's `agent/reasoning_effort.py` and `github-copilot` provider profile:
+- `codex_responses` (`/responses`): GPT-5+ except `gpt-5-mini`, `gpt-6*`, `mai-code-*`, `grok-*`.
+  `minimal` is rejected on `/responses` (clamps to `low`), while `xhigh` (and `max` on GPT-5.6 /
+  GPT-6 Astra / Sol) IS supported! Reasoning lives at `request["reasoning"] = {"effort": ..., "summary": "auto"}`.
+- `chat_completions` (`/chat/completions`): `gpt-5-mini`, `gpt-4.1`, `gpt-4o*`, `claude-*`, `gemini-*`.
+  `claude-sonnet-5` / `claude-opus-5` support `("low", "medium", "high", "xhigh", "max")`.
+  `gemini-3.8+` / `gemini-4*` support `("low", "medium", "high")` (`minimal` 400s).
+  Non-reasoning models (`claude-haiku-4.5`, `gpt-4.1`, `gpt-4o-mini`) reject `reasoning_effort` (400).
 - Signed carrier guard: Gemini 3/4 thinking turns attach `thought_signature` on tool calls,
-  and Copilot Responses sessions may attach `reasoning_opaque`. Switching model families mid-
-  session when signed carriers are present in history will 400, so Trismegistus stays on the
-  active model and modulates effort only.
+  and Copilot Responses/Chat attaches `reasoning_opaque`.
 """
 
 from __future__ import annotations
@@ -21,12 +21,15 @@ _DUAL_RESPONSES_PREFIXES = ("mai-code-", "grok-")
 
 EFFORT_ORDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
-EFFORTS_GPT5: tuple[str, ...] = ("minimal", "low", "medium", "high")
+EFFORTS_CHAT_GPT5: tuple[str, ...] = ("minimal", "low", "medium", "high")
+EFFORTS_CODEX_LEGACY: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh")
+EFFORTS_CODEX_GPT56_PLUS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
+EFFORTS_GPT6_NO_DISABLE: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 EFFORTS_O_SERIES: tuple[str, ...] = ("low", "medium", "high")
 EFFORTS_GEMINI_THINKING: tuple[str, ...] = ("low", "medium", "high")
 EFFORTS_CLAUDE5: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+EFFORTS_GROK46_PLUS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
 
-# Copilot model ID normalization (mirrors github-copilot MODEL_ALIASES for hyphen vs dot Claude IDs)
 COPILOT_ID_ALIASES: dict[str, str] = {
     "claude-opus-4-6": "claude-opus-4.6",
     "claude-sonnet-4-6": "claude-sonnet-4.6",
@@ -35,6 +38,7 @@ COPILOT_ID_ALIASES: dict[str, str] = {
     "claude-haiku-4-5": "claude-haiku-4.5",
     "anthropic/claude-opus-4.6": "claude-opus-4.6",
     "anthropic/claude-sonnet-5": "claude-sonnet-5",
+    "anthropic/claude-opus-5": "claude-opus-5",
     "anthropic/claude-sonnet-4.6": "claude-sonnet-4.6",
     "anthropic/claude-sonnet-4.5": "claude-sonnet-4.5",
     "anthropic/claude-haiku-4.5": "claude-haiku-4.5",
@@ -82,20 +86,36 @@ def model_family(model_id: str | None) -> str:
     return "other"
 
 
-def supported_reasoning_efforts(model_id: str | None, *, provider: str = "") -> tuple[str, ...]:
-    """Return supported `reasoning_effort` levels for a model (empty tuple if unsupported)."""
+def supported_reasoning_efforts(
+    model_id: str | None,
+    *,
+    provider: str = "",
+    api_mode: str = "",
+) -> tuple[str, ...]:
+    """Return wire-valid `reasoning_effort` levels for `(model_id, provider, api_mode)`."""
     norm = normalize_copilot_model(model_id).lower()
     if not norm:
         return ()
+
+    effective_mode = api_mode or infer_copilot_api_mode(norm)
+
     if norm.startswith(("o1", "o3", "o4", "openai/o1", "openai/o3", "openai/o4")):
         return EFFORTS_O_SERIES
-    if norm.startswith("gpt-5"):
-        return EFFORTS_GPT5
+    if norm.startswith(("gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol")):
+        return EFFORTS_GPT6_NO_DISABLE
+    if norm.startswith("gpt-6") or norm.startswith("gpt-5.6"):
+        return EFFORTS_CODEX_GPT56_PLUS if effective_mode == "codex_responses" else EFFORTS_CHAT_GPT5
+    if norm.startswith(("gpt-5", "mai-code-")):
+        if effective_mode == "codex_responses":
+            return EFFORTS_CODEX_LEGACY
+        return EFFORTS_CHAT_GPT5
+    if norm.startswith("grok-"):
+        return EFFORTS_GROK46_PLUS
     if norm.startswith(("gemini-4", "gemini-3.8", "gemini-3.1-pro", "gemini-3-pro", "gemini-2.5-pro")):
         return EFFORTS_GEMINI_THINKING
     if norm.startswith(("claude-opus-5", "claude-sonnet-5", "claude-haiku-5")):
         return EFFORTS_CLAUDE5
-    # Non-Copilot generic reasoning models (e.g. DeepSeek-R1, QwQ, OpenRouter o-series)
+
     if provider.lower() not in ("copilot", "github-copilot", "github"):
         if any(tag in norm for tag in ("reasoner", "thinking", "-r1", "qwq")):
             return EFFORTS_O_SERIES
@@ -103,31 +123,24 @@ def supported_reasoning_efforts(model_id: str | None, *, provider: str = "") -> 
 
 
 def clamp_effort(desired: str, supported: tuple[str, ...]) -> str | None:
-    """Clamp `desired` to `supported`, preferring the nearest weaker supported level."""
+    """Clamp `desired` onto `supported`, never collapsing to `none` unless explicitly requested."""
     if not supported:
         return None
     target = str(desired or "medium").strip().lower()
     if target in supported:
         return target
+    candidates = [lvl for lvl in supported if lvl != "none"] or list(supported)
     if target in EFFORT_ORDER:
         idx = EFFORT_ORDER.index(target)
-        # Search downward first (nearest weaker level), then upward
-        for i in range(idx - 1, -1, -1):
-            if EFFORT_ORDER[i] in supported:
-                return EFFORT_ORDER[i]
-        for i in range(idx + 1, len(EFFORT_ORDER)):
-            if EFFORT_ORDER[i] in supported:
-                return EFFORT_ORDER[i]
-    return "medium" if "medium" in supported else supported[0]
+        below = [lvl for lvl in candidates if EFFORT_ORDER.index(lvl) < idx]
+        if below:
+            return max(below, key=EFFORT_ORDER.index)
+        return min(candidates, key=EFFORT_ORDER.index)
+    return "medium" if "medium" in candidates else candidates[0]
 
 
 def has_signed_replay_carriers(request: dict[str, Any]) -> bool:
-    """Detect provider/family-bound cryptographic replay carriers in the outgoing request.
-
-    Gemini 3/4 thinking attaches `thought_signature` / `extra_content` to tool calls, and
-    Copilot Responses/Chat attaches `reasoning_opaque`. Switching model families mid-session
-    once these exist in history triggers HTTP 400/401 from upstream.
-    """
+    """Detect provider/family-bound cryptographic replay carriers in the outgoing request."""
     messages = request.get("messages")
     if isinstance(messages, list):
         for msg in messages:
@@ -162,14 +175,12 @@ def default_copilot_peer(active_model: str, target_tier: str, api_mode: str) -> 
     if api_mode == "codex_responses":
         if target_tier == "system1":
             return "gpt-5.4-mini"
-        # System 2: keep active high-end Responses model, or upgrade gpt-5.4-mini -> gpt-5.4
         return "gpt-5.4" if low in ("gpt-5.4-mini",) else (norm or "gpt-5.4")
 
-    # chat_completions lane
     if fam == "claude":
         if target_tier == "system1":
             return "claude-haiku-4.5"
-        return "claude-sonnet-4.6" if "haiku" in low else norm
+        return "claude-sonnet-5" if "haiku" in low else norm
     if fam == "gemini":
         if target_tier == "system1":
             return "gemini-3-flash-preview"
@@ -177,8 +188,7 @@ def default_copilot_peer(active_model: str, target_tier: str, api_mode: str) -> 
     if fam == "openai":
         if target_tier == "system1":
             return "gpt-5-mini"
-        # Stay on chat_completions wire! gpt-5.4 would require codex_responses, so upgrade to claude-sonnet-4.6
-        return "claude-sonnet-4.6" if low in ("gpt-5-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini") else norm
+        return "claude-sonnet-5" if low in ("gpt-5-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini") else norm
 
     return norm
 
@@ -210,7 +220,6 @@ def can_safely_swap_model(
                 False,
                 f"signed_carrier_guard(cannot cross {model_family(cur)}->{model_family(cand)} mid-session)",
             )
-        # Gemini thinking models require thought_signature continuity even across Flash/Pro variants
         if model_family(cur) == "gemini" and has_signed_replay_carriers(request) and cand != cur:
             return (
                 False,
@@ -230,7 +239,7 @@ def apply_effort_to_request(
 ) -> tuple[dict[str, Any], str | None]:
     """Apply or strip reasoning effort according to `api_mode` and model support."""
     updated = dict(request)
-    supported = supported_reasoning_efforts(effective_model, provider=provider)
+    supported = supported_reasoning_efforts(effective_model, provider=provider, api_mode=api_mode)
     clamped = clamp_effort(effort, supported)
 
     if api_mode == "codex_responses":
@@ -250,8 +259,6 @@ def apply_effort_to_request(
         if clamped:
             updated["reasoning_effort"] = clamped
             return updated, clamped
-        # On Copilot, our reasoning-effort table is authoritative: models outside it
-        # (e.g. claude-haiku-4.5, gpt-4.1, gpt-4o-mini) reject `reasoning_effort` with HTTP 400.
         if (
             provider.lower() not in ("copilot", "github-copilot", "github")
             and "reasoning_effort" in updated
