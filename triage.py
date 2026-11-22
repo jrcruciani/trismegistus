@@ -117,7 +117,7 @@ def run_turn_triage(
     """Run Stage 1 (Triage) in a single multi-question System-1 pass."""
     max_chars = int(ctx.get_config("max_excerpt_chars", default=2400) or 2400)
     conf_threshold = float(ctx.get_config("confidence_threshold", default=0.82) or 0.82)
-    trap_threshold = float(ctx.get_config("trap_risk_threshold", default=0.30) or 0.30)
+    trap_threshold = float(ctx.get_config("trap_risk_threshold", default=0.50) or 0.50)
     err_cap = max(1, int(ctx.get_config("escalate_after_errors", default=2) or 2))
 
     err_streak = int(ctx.state.get(f"err_streak:{session_id}", default=0) or 0) if session_id else 0
@@ -183,7 +183,7 @@ def run_turn_triage(
         effective_tier = "system2"
         abstained = True
 
-    # 2. Hidden-trap veto: even if prompt looks short/routine, trap_risk >= 0.30 forces System 2
+    # 2. Hidden-trap veto: even if prompt looks short/routine, trap_risk >= 0.50 default forces System 2
     if trap_risk_prob >= trap_threshold and effective_tier == "system1":
         effective_tier = "system2"
         trap_blocked = True

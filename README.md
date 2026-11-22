@@ -1,6 +1,12 @@
-# Trismegistus (`v0.2.0`)
+# Trismegistus (`v0.2.1`)
 
-**Precision & performance System-1 / System-2 cognitive router for [Hermes Agent](https://github.com/NousResearch/hermes-agent)** (`Triage → Modulation → Call`), built to pair **Microsoft-Decision-1.1 on Microsoft Foundry** (`0` output tokens, warm TLS Keep-Alive) with deliberative **frontier models on GitHub Copilot** — without sacrificing accuracy or invalidating prompt KV cache.
+**Precision & performance System-1 / System-2 cognitive router for [Hermes Agent](https://github.com/NousResearch/hermes-agent)** (`Triage → Modulation → Call`).
+
+> **Reference design:** Trismegistus was designed and tuned for **GitHub Copilot as the execution provider** and **Microsoft Foundry / `Microsoft-Decision-1.1` as the decision backend**. That pairing is the tested fast path: model tiers, reasoning effort, delegation presets, and wire-level safeguards encode Copilot behavior, while non-Copilot execution providers fall back to **safe passthrough** (never injecting Copilot model IDs or incompatible reasoning fields, and still enforcing signed replay-carrier guards).
+>
+> For provider-neutral planning, safe rollout guidance, and the current limitations of OpenAI-compatible, Anthropic, Gemini, Azure, and local endpoints, see [Recommendations for Other Providers](docs/other-providers.md).
+
+The reference configuration pairs **Microsoft-Decision-1.1 on Microsoft Foundry** (`0` output tokens, warm TLS Keep-Alive) with deliberative **frontier models on GitHub Copilot**, without sacrificing accuracy or invalidating prompt KV cache.
 
 ---
 
@@ -18,7 +24,7 @@ Warm TLS 1.3 Keep-Alive POST       • 5-rung effort ladder:             • Fai
   • trap_risk (noul: 0..1)           - Same model = 100% warm KV!        - fast_scout -> gemini-3-flash
   • needs_plan (noul: 0..1)        • Copilot wire & carrier guards:      - deep_code  -> gpt-5.4 (xhigh)
 • Asymmetric precision floor:        chat_completions vs responses,      - architect  -> claude-sonnet-5
-  conf < 0.82 OR trap >= 0.30        thought_signature / opaque          - long_ctx   -> gemini-3.1-pro
+  conf < 0.82 OR trap >= 0.50        thought_signature / opaque          - long_ctx   -> gemini-3.1-pro
   -> Veto S1, lock System 2
 ```
 
@@ -30,7 +36,7 @@ Warm TLS 1.3 Keep-Alive POST       • 5-rung effort ladder:             • Fai
    - `Microsoft-Decision-1.1` evaluates **four orthogonal questions in a single forward pass** (`tier`, `effort`, `trap_risk`, `needs_plan`) with `0` generated tokens (`$0.042 / 1M` input tokens on Foundry).
    - Thread-safe `KeepAliveHttpPool` reuses warm TLS 1.3 sockets across turns (saving ~80–150 ms per turn), automatically recovers from idle upstream disconnects, and caps triage timeout at `1.2s` (failing open immediately to System 2).
 2. **Asymmetric Precision Floor & Hidden-Trap Gate (`triage.py`)**:
-   - Lowering effort is only allowed when **both** `confidence >= 0.82` **and** `trap_risk < 0.30`.
+   - Lowering effort is only allowed when **both** `confidence >= 0.82` **and** `trap_risk < 0.50`.
    - Deceptively short prompts that hide concurrency hazards, state coupling, auth/security invariants, or subtle context dependencies trip `trap_risk` and stay on System 2 (`high`/`xhigh`).
 3. **5-Rung Effort Ladder Unlocking `xhigh` (`copilot_lanes.py`)**:
    - Unlocks `xhigh` reasoning on `gpt-5.4` (`/responses`), `claude-sonnet-5` (`/chat/completions`), and `gpt-6*`, while clamping `minimal -> low` on `/responses` so Copilot never returns HTTP 400.

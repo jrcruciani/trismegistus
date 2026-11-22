@@ -174,6 +174,64 @@ def test_hidden_trap_gate_vetoes_false_system1_downgrade(pkg):
     assert "trap_guard->s2" in mw_out["reason"]
 
 
+def test_default_trap_risk_threshold_is_calibrated_to_050(pkg):
+    """Default trap_risk_threshold (0.50) allows routine 0.42 turns in System 1 while vetoing 0.52."""
+    ctx = _StubPluginContext(
+        config={"mode": "effort_only", "backend": "hermes_aux"},
+        scripted_decisions=[
+            {
+                "tier": {"choice": "system1", "confidence": 0.96},
+                "effort": {"score": 0.6, "confidence": 0.92},
+                "trap_risk": {"noul": 0.42},
+                "needs_plan": {"noul": 0.08},
+            },
+            {
+                "tier": {"choice": "system1", "confidence": 0.96},
+                "effort": {"score": 0.6, "confidence": 0.92},
+                "trap_risk": {"noul": 0.52},
+                "needs_plan": {"noul": 0.08},
+            },
+        ],
+    )
+    pkg.register(ctx)
+
+    ctx.hooks["pre_llm_call"](
+        session_id="ses_t042",
+        user_message="Show weather in Vienna",
+        conversation_history=[],
+        model="gpt-5.4",
+        platform="cli",
+    )
+    out_ok = ctx.middleware["llm_request"](
+        request={"model": "gpt-5.4", "input": []},
+        session_id="ses_t042",
+        provider="copilot",
+        model="gpt-5.4",
+        api_mode="codex_responses",
+        api_call_count=1,
+    )
+    assert out_ok["request"]["reasoning"]["effort"] == "low"
+    assert "trap_guard->s2" not in out_ok["reason"]
+
+    ctx.hooks["pre_llm_call"](
+        session_id="ses_t052",
+        user_message="Restart service if config drifted",
+        conversation_history=[],
+        model="gpt-5.4",
+        platform="cli",
+    )
+    out_veto = ctx.middleware["llm_request"](
+        request={"model": "gpt-5.4", "input": []},
+        session_id="ses_t052",
+        provider="copilot",
+        model="gpt-5.4",
+        api_mode="codex_responses",
+        api_call_count=1,
+    )
+    assert out_veto["request"]["reasoning"]["effort"] == "medium"
+    assert "trap_guard->s2" in out_veto["reason"]
+
+
 def test_dynamic_intra_turn_step_pacing_preserves_model_and_restores_xhigh(pkg):
     """Step 1 plans at `xhigh`; read_file steps pace to `medium` for speed; patch restores `xhigh`!"""
     ctx = _StubPluginContext(
@@ -394,6 +452,38 @@ def test_specialty_delegation_provider_routes_four_cognitive_lanes(pkg):
     r_guarded = dp.route_task({"goal": "Check subtle auth middleware"}, {})
     assert r_guarded["model"] == "gpt-5.4"
     assert r_guarded["reasoning_effort"] == "xhigh"
+
+
+def test_non_copilot_delegation_inherits_host_route_instead_of_copilot_ids(pkg):
+    ctx = _StubPluginContext(
+        config={
+            "backend": "hermes_aux",
+            "delegation_provider": "openrouter",
+            "confidence_threshold": 0.82,
+        },
+        scripted_decisions=[
+            {"specialty": {"choice": "architecture", "confidence": 0.94}},
+            {"specialty": {"choice": "fast_scout", "confidence": 0.95}},
+        ],
+    )
+    pkg.register(ctx)
+    dp = ctx.delegation_provider
+
+    # 1. Without explicit OpenRouter model IDs, never inject Copilot's `claude-sonnet-5`:
+    #    return label-only route so Hermes core inherits the parent's configured route cleanly.
+    r_inherit = dp.route_task({"goal": "Design adapter boundaries"}, {})
+    assert "model" not in r_inherit
+    assert "reasoning_effort" not in r_inherit
+    assert r_inherit["label"] == "trismegistus:architecture"
+
+    # 2. When user explicitly configures a specialty model on that provider, route to it without Copilot xhigh.
+    ctx.set_config("delegation_scout_model", "google/gemini-2.5-flash")
+    r_explicit = dp.route_task({"goal": "Find YAML manifests"}, {})
+    assert r_explicit == {
+        "provider": "openrouter",
+        "model": "google/gemini-2.5-flash",
+        "label": "trismegistus:fast_scout",
+    }
 
 
 def test_tool_risk_gate_default_verify_gate_and_tools(pkg):

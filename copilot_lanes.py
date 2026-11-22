@@ -48,6 +48,10 @@ COPILOT_ID_ALIASES: dict[str, str] = {
 }
 
 
+def is_copilot_provider(provider: str | None) -> bool:
+    return str(provider or "").strip().lower() in ("copilot", "github-copilot", "github")
+
+
 def normalize_copilot_model(model_id: str | None) -> str:
     raw = str(model_id or "").strip()
     if not raw:
@@ -75,13 +79,14 @@ def infer_copilot_api_mode(model_id: str | None) -> str:
 
 def model_family(model_id: str | None) -> str:
     norm = normalize_copilot_model(model_id).lower()
-    if "claude" in norm:
+    bare = norm.split("/", 1)[-1] if "/" in norm else norm
+    if "claude" in bare:
         return "claude"
-    if "gemini" in norm:
+    if "gemini" in bare:
         return "gemini"
-    if norm.startswith(("gpt-", "o1", "o3", "o4", "mai-code")):
+    if bare.startswith(("gpt-", "o1", "o3", "o4", "mai-code")):
         return "openai"
-    if norm.startswith("grok"):
+    if bare.startswith("grok"):
         return "grok"
     return "other"
 
@@ -202,12 +207,13 @@ def can_safely_swap_model(
     request: dict[str, Any],
 ) -> tuple[bool, str]:
     """Verify wire-mode and replay-carrier safety before changing `request['model']`."""
-    cur = normalize_copilot_model(current_model) if provider == "copilot" else str(current_model or "").strip()
-    cand = normalize_copilot_model(candidate_model) if provider == "copilot" else str(candidate_model or "").strip()
+    is_copilot = provider.lower() in ("copilot", "github-copilot", "github")
+    cur = normalize_copilot_model(current_model) if is_copilot else str(current_model or "").strip()
+    cand = normalize_copilot_model(candidate_model) if is_copilot else str(candidate_model or "").strip()
     if not cand or cand == cur:
         return True, "same_model"
 
-    if provider in ("copilot", "github-copilot", "github"):
+    if is_copilot:
         cand_wire = infer_copilot_api_mode(cand)
         effective_wire = api_mode or infer_copilot_api_mode(cur)
         if cand_wire != effective_wire:
@@ -215,12 +221,14 @@ def can_safely_swap_model(
                 False,
                 f"wire_mismatch({cand} requires {cand_wire}, session is {effective_wire})",
             )
-        if has_signed_replay_carriers(request) and model_family(cand) != model_family(cur):
+
+    if has_signed_replay_carriers(request):
+        if model_family(cand) != model_family(cur):
             return (
                 False,
                 f"signed_carrier_guard(cannot cross {model_family(cur)}->{model_family(cand)} mid-session)",
             )
-        if model_family(cur) == "gemini" and has_signed_replay_carriers(request) and cand != cur:
+        if model_family(cur) == "gemini" and cand != cur:
             return (
                 False,
                 "gemini_thought_signature_guard(keep active Gemini model)",
@@ -237,8 +245,34 @@ def apply_effort_to_request(
     provider: str,
     api_mode: str,
 ) -> tuple[dict[str, Any], str | None]:
-    """Apply or strip reasoning effort according to `api_mode` and model support."""
+    """Apply or strip reasoning effort on Copilot; use safe passthrough on other providers."""
     updated = dict(request)
+
+    if not is_copilot_provider(provider):
+        prov = str(provider or "").strip().lower()
+        if prov == "anthropic" or api_mode == "anthropic_messages":
+            return updated, None
+        if api_mode == "codex_responses":
+            existing_reasoning = updated.get("reasoning")
+            if isinstance(existing_reasoning, dict) and "effort" in existing_reasoning:
+                clamped_non_cp = clamp_effort(effort, EFFORTS_O_SERIES)
+                if clamped_non_cp:
+                    base_reasoning = dict(existing_reasoning)
+                    base_reasoning["effort"] = clamped_non_cp
+                    updated["reasoning"] = base_reasoning
+                    return updated, clamped_non_cp
+            return updated, None
+        if (
+            api_mode == "chat_completions"
+            and "reasoning_effort" in updated
+            and effective_model == request.get("model")
+        ):
+            clamped_non_cp = clamp_effort(effort, EFFORTS_O_SERIES)
+            if clamped_non_cp:
+                updated["reasoning_effort"] = clamped_non_cp
+                return updated, clamped_non_cp
+        return updated, None
+
     supported = supported_reasoning_efforts(effective_model, provider=provider, api_mode=api_mode)
     clamped = clamp_effort(effort, supported)
 
@@ -259,14 +293,6 @@ def apply_effort_to_request(
         if clamped:
             updated["reasoning_effort"] = clamped
             return updated, clamped
-        if (
-            provider.lower() not in ("copilot", "github-copilot", "github")
-            and "reasoning_effort" in updated
-            and effective_model == request.get("model")
-        ):
-            fallback_clamped = clamp_effort(effort, EFFORTS_O_SERIES)
-            updated["reasoning_effort"] = fallback_clamped
-            return updated, fallback_clamped
         updated.pop("reasoning_effort", None)
         return updated, None
 

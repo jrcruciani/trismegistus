@@ -1,16 +1,16 @@
 ---
 name: trismegistus
 description: "Use when escalating to System-2 reasoning, querying System-1 decisions, or routing subagents."
-version: "0.2.0"
+version: "0.2.1"
 ---
 
-# Trismegistus v0.2 — Precision & Performance Cognitive Routing
+# Trismegistus v0.2.1 — Precision & Performance Cognitive Routing
 
-Trismegistus pairs `Microsoft-Decision-1.1` on Microsoft Foundry (`0` output tokens, warm TLS Keep-Alive) with deliberative frontier models on GitHub Copilot across three stages: **Triage → Modulation → Call**.
+Trismegistus pairs `Microsoft-Decision-1.1` on Microsoft Foundry (`0` output tokens, warm TLS Keep-Alive) with deliberative frontier models on GitHub Copilot across three stages: **Triage → Modulation → Call** (using safe passthrough on non-Copilot execution providers).
 
 ## How Dynamic Effort & Step Pacing Work
 
-- **Asymmetric Precision Floor (`confidence >= 0.82` & `trap_risk < 0.30`)**: Short prompts that hide concurrency, state, security, or cross-file traps are automatically vetoed up to System 2 (`high`/`xhigh` effort).
+- **Asymmetric Precision Floor (`confidence >= 0.82` & `trap_risk < 0.50`)**: Short prompts that hide concurrency, state, security, or cross-file traps are automatically vetoed up to System 2 (`high`/`xhigh` effort).
 - **5-Rung Effort Ladder (`minimal`..`xhigh`)**: Complex engineering tasks unlock `xhigh` reasoning on `gpt-5.4` (`/responses`) and `claude-sonnet-5` (`/chat/completions`).
 - **Dynamic Intra-Turn Step Pacing**: During multi-step tool loops, Trismegistus paces intermediate read-only scout steps (`read_file`, `search_files`) down to `medium`/`low` effort on the **same model** (100% warm KV cache, saving 5–12s per read), and immediately restores full `high`/`xhigh` effort when you edit files (`patch`, `write_file`), run `terminal`, hit an error, or synthesize the final answer.
 

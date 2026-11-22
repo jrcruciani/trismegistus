@@ -16,7 +16,12 @@ from typing import Any
 from .backends import build_decision_backend
 from .compat import BaseDelegationProvider, DelegationRouteError, redact_text
 from .contracts import DecisionQuestion
-from .copilot_lanes import clamp_effort, normalize_copilot_model, supported_reasoning_efforts
+from .copilot_lanes import (
+    clamp_effort,
+    is_copilot_provider,
+    normalize_copilot_model,
+    supported_reasoning_efforts,
+)
 
 VALID_COGNITIVE_TIERS: tuple[str, ...] = (
     "auto",
@@ -102,14 +107,16 @@ class TrismegistusDelegationProvider(BaseDelegationProvider):
             specialty,
             ("deep_code_model", "delegation_deep_code_model", "gpt-5.4", "xhigh"),
         )
-        raw_model = str(
+        is_copilot = is_copilot_provider(provider)
+        configured = str(
             own.get(own_key)
-            or self._ctx.get_config(cfg_key, default=fallback_model)
-            or fallback_model
+            or self._ctx.get_config(cfg_key, default="")
+            or ""
         ).strip()
-        if provider in ("copilot", "github-copilot", "github"):
-            raw_model = normalize_copilot_model(raw_model)
-        return raw_model, desired_effort
+        if is_copilot:
+            raw_model = normalize_copilot_model(configured or fallback_model)
+            return raw_model, desired_effort
+        return configured, desired_effort
 
     def route_task(self, task: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         own = self.settings(config)
@@ -153,6 +160,15 @@ class TrismegistusDelegationProvider(BaseDelegationProvider):
                 specialty = "deep_code"
 
         model_id, desired_effort = self._resolve_specialty_target(specialty, own, provider)
+        if not is_copilot_provider(provider):
+            if not model_id:
+                return {"label": f"trismegistus:{specialty}"}
+            return {
+                "provider": provider,
+                "model": model_id,
+                "label": f"trismegistus:{specialty}",
+            }
+
         route: dict[str, Any] = {
             "provider": provider,
             "model": model_id,

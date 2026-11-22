@@ -62,6 +62,7 @@ def read_secret(env_name: str) -> str:
         val = get_secret(env_name)
         return str(val or "").strip()
     except ImportError:
+        # Standalone pytest fallback outside the Hermes runtime
         return str(os.getenv(env_name) or "").strip()
 
 
@@ -70,9 +71,9 @@ def user_agent() -> str:
     try:
         from hermes_cli.version_info import hermes_user_agent
 
-        return hermes_user_agent("trismegistus/0.2.0")
+        return hermes_user_agent("trismegistus/0.2.1")
     except ImportError:
-        return "Hermes-Trismegistus/0.2.0"
+        return "Hermes-Trismegistus/0.2.1"
 
 
 class _BytesHttpResponse:

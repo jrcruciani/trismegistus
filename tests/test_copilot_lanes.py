@@ -85,6 +85,51 @@ def test_gemini_thought_signature_carrier_blocks_mid_session_swap(pkg):
     assert "thought_signature" in why
 
 
+def test_non_copilot_signed_replay_carrier_blocks_mid_session_swap(pkg):
+    can_swap = pkg.copilot_lanes.can_safely_swap_model
+    req_with_sig = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{}",
+                            "thought_signature": "opaque-sig-bytes",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    ok_gemini, why_gemini = can_swap(
+        provider="openrouter",
+        api_mode="chat_completions",
+        current_model="google/gemini-2.5-pro",
+        candidate_model="google/gemini-2.5-flash",
+        request=req_with_sig,
+    )
+    assert not ok_gemini
+    assert "thought_signature" in why_gemini
+
+    req_with_encrypted = {
+        "input": [{"type": "reasoning", "encrypted_content": "enc_abc123"}]
+    }
+    ok_cross, why_cross = can_swap(
+        provider="openrouter",
+        api_mode="codex_responses",
+        current_model="openai/gpt-5.4",
+        candidate_model="anthropic/claude-sonnet-4.6",
+        request=req_with_encrypted,
+    )
+    assert not ok_cross
+    assert "signed_carrier_guard" in why_cross
+
+
 def test_effort_encoding_xhigh_unlocking_and_responses_minimal_clamp(pkg):
     apply_eff = pkg.copilot_lanes.apply_effort_to_request
 
@@ -152,3 +197,52 @@ def test_effort_encoding_xhigh_unlocking_and_responses_minimal_clamp(pkg):
     )
     assert updated_c5["reasoning_effort"] == "xhigh"
     assert eff_c5 == "xhigh"
+
+
+def test_non_copilot_providers_passthrough_without_injecting_or_stripping_fields(pkg):
+    apply_eff = pkg.copilot_lanes.apply_effort_to_request
+
+    # 1. Direct Anthropic provider must NEVER receive Copilot's `reasoning_effort` field
+    anth_req = {
+        "model": "claude-sonnet-5",
+        "thinking": {"type": "enabled", "budget_tokens": 8192},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    out_anth, eff_anth = apply_eff(
+        anth_req,
+        effort="xhigh",
+        effective_model="claude-sonnet-5",
+        provider="anthropic",
+        api_mode="chat_completions",
+    )
+    assert out_anth == anth_req
+    assert "reasoning_effort" not in out_anth
+    assert eff_anth is None
+
+    # 2. Custom Azure/OpenAI Responses deployment must NOT have its existing `reasoning` stripped
+    az_req = {
+        "model": "my-enterprise-deployment",
+        "reasoning": {"effort": "high", "summary": "concise"},
+        "input": [],
+    }
+    out_az, eff_az = apply_eff(
+        az_req,
+        effort="low",
+        effective_model="my-enterprise-deployment",
+        provider="azure",
+        api_mode="codex_responses",
+    )
+    assert out_az["reasoning"] == {"effort": "low", "summary": "concise"}
+    assert eff_az == "low"
+
+    # 3. Unknown OpenRouter model without existing reasoning_effort stays untouched
+    or_req = {"model": "meta-llama/llama-4-maverick", "messages": []}
+    out_or, eff_or = apply_eff(
+        or_req,
+        effort="high",
+        effective_model="meta-llama/llama-4-maverick",
+        provider="openrouter",
+        api_mode="chat_completions",
+    )
+    assert out_or == or_req
+    assert eff_or is None

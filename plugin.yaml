@@ -1,6 +1,6 @@
 manifest_version: 2
 name: trismegistus
-version: "0.2.0"
+version: "0.2.1"
 requires_hermes: ">=0.23.0"
 author: Jorge Luis Revilla
 description: "Precision & performance System-1 / System-2 cognitive router (Triage -> Modulation -> Call) powered by Microsoft-Decision-1.1 on Foundry and wire-safe across GitHub Copilot models."
@@ -75,9 +75,9 @@ config_schema:
     description: "Asymmetric confidence floor (0-1) required before lowering effort to System 1; below 0.82 Trismegistus abstains upward to System 2."
   trap_risk_threshold:
     type: float
-    default: 0.30
+    default: 0.50
     label: "Hidden Trap Risk Threshold"
-    description: "Maximum tolerated probability on the 'trap_risk' noul gate; at or above 0.30, low/minimal effort is blocked even for short prompts."
+    description: "Maximum tolerated probability on the 'trap_risk' noul gate; at or above 0.50, low/minimal effort is blocked even for short prompts."
   step_pacing_enabled:
     type: bool
     default: true

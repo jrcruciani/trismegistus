@@ -117,11 +117,16 @@ def modulate_llm_request(
 
     active_provider = str(provider or "").strip().lower()
     current_model = str(request.get("model") or model or "").strip()
-    effective_wire = str(api_mode or "").strip() or (
-        infer_copilot_api_mode(current_model)
-        if active_provider in ("copilot", "github-copilot", "github")
-        else "chat_completions"
-    )
+    if api_mode:
+        effective_wire = str(api_mode).strip()
+    elif active_provider in ("copilot", "github-copilot", "github"):
+        effective_wire = infer_copilot_api_mode(current_model)
+    elif active_provider == "anthropic":
+        effective_wire = "anthropic_messages"
+    elif "input" in request and "messages" not in request:
+        effective_wire = "codex_responses"
+    else:
+        effective_wire = "chat_completions"
 
     cfg_s1 = str(ctx.get_config("system1_model", default="") or "").strip()
     cfg_s2 = str(ctx.get_config("system2_model", default="") or "").strip()
