@@ -159,6 +159,36 @@ class TrismegistusDelegationProvider(BaseDelegationProvider):
             else:
                 specialty = "deep_code"
 
+        # Provider-neutral structured per-specialty routes (`backends.trismegistus.routes.<specialty>`)
+        # allow mixing providers cleanly without ever leaking Copilot defaults to other providers.
+        raw_routes = own.get("routes")
+        structured_routes: dict[str, Any] = raw_routes if isinstance(raw_routes, dict) else {}
+        explicit_route = structured_routes.get(specialty)
+        if isinstance(explicit_route, dict) and explicit_route.get("model"):
+            r_provider = str(explicit_route.get("provider") or provider).strip()
+            r_model = str(explicit_route["model"]).strip()
+            if is_copilot_provider(r_provider):
+                r_model = normalize_copilot_model(r_model)
+            route_out: dict[str, Any] = {
+                "provider": r_provider,
+                "model": r_model,
+                "label": f"trismegistus:{specialty}",
+            }
+            r_api_mode = str(explicit_route.get("api_mode") or "").strip()
+            if r_api_mode:
+                route_out["api_mode"] = r_api_mode
+            if explicit_route.get("reasoning_effort"):
+                desired = str(explicit_route["reasoning_effort"]).strip()
+                supported = supported_reasoning_efforts(
+                    r_model,
+                    provider=r_provider,
+                    api_mode=r_api_mode,
+                )
+                clamped = clamp_effort(desired, supported) if supported else desired
+                if clamped:
+                    route_out["reasoning_effort"] = clamped
+            return route_out
+
         model_id, desired_effort = self._resolve_specialty_target(specialty, own, provider)
         if not is_copilot_provider(provider):
             if not model_id:

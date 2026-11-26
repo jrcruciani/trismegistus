@@ -22,17 +22,97 @@ from .backends import build_decision_backend
 from .compat import redact_text
 from .contracts import DecisionQuestion
 from .delegation import TrismegistusDelegationProvider
-from .ledger import handle_slash_command, record_turn_completion
+from .ledger import handle_slash_command, record_turn_completion, record_turn_outcome
 from .modulation import TurnSessionRegistry, execute_with_failopen, modulate_llm_request
 from .triage import (
     MUTATING_TOOLS,
     READ_ONLY_SCOUT_TOOLS,
+    _STACKTRACE_RE,
     evaluate_tool_risk,
     evaluate_verify_gate,
     run_turn_triage,
 )
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
+
+_CONSTANT_SYSTEM2_PLAN_NOTE = (
+    "[Trismegistus System-2 Note: High structural complexity detected. "
+    "Verify assumptions and invariants before mutating files.]"
+)
+
+
+def _extract_usage_metrics(usage: Any) -> tuple[int, int, int, int, int]:
+    """Extract `(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)`.
+
+    Supports OpenAI Responses (`input_tokens_details`), OpenAI Chat (`prompt_tokens_details`,
+    `completion_tokens_details`), Anthropic (`cache_read_input_tokens`, `cache_creation_input_tokens`),
+    and Gemini usage payloads.
+    """
+    if usage is None:
+        return 0, 0, 0, 0, 0
+
+    def _get(obj: Any, *keys: str) -> Any:
+        for k in keys:
+            if isinstance(obj, dict):
+                v = obj.get(k)
+            else:
+                v = getattr(obj, k, None)
+            if v is not None:
+                return v
+        return None
+
+    in_tok = int(_get(usage, "input_tokens", "prompt_tokens") or 0)
+    out_tok = int(_get(usage, "output_tokens", "completion_tokens") or 0)
+
+    in_details = _get(usage, "input_tokens_details", "prompt_tokens_details")
+    out_details = _get(usage, "output_tokens_details", "completion_tokens_details")
+
+    cache_read = int(
+        _get(usage, "cache_read_input_tokens", "cached_input_tokens", "cached_tokens")
+        or (_get(in_details, "cached_tokens", "cache_read_tokens") if in_details is not None else 0)
+        or 0
+    )
+    cache_write = int(
+        _get(usage, "cache_creation_input_tokens", "cache_write_tokens")
+        or (_get(in_details, "cache_creation_tokens", "cache_write_tokens") if in_details is not None else 0)
+        or 0
+    )
+    reasoning_tok = int(
+        _get(usage, "reasoning_tokens", "thoughts_token_count")
+        or (_get(out_details, "reasoning_tokens") if out_details is not None else 0)
+        or 0
+    )
+    return in_tok, out_tok, cache_read, cache_write, reasoning_tok
+
+
+def _is_tool_result_error(tool_name: str, result: Any, status: str) -> bool:
+    """Detect real tool failures without false positives on file contents containing `'error':`."""
+    if str(status or "").strip().lower() == "error":
+        return True
+    # Read-only scout tools return raw source files / JSON documents that legitimately contain
+    # substrings like `"error":` — never treat file contents as a tool execution failure!
+    if tool_name in READ_ONLY_SCOUT_TOOLS:
+        return False
+    raw = str(result or "").strip()
+    if not raw:
+        return False
+    if raw.startswith("{") and len(raw) <= 65536:
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                if obj.get("success") is False or obj.get("ok") is False:
+                    return True
+                err_val = obj.get("error")
+                if err_val not in (None, False, "", 0):
+                    return True
+                exit_code = obj.get("exit_code")
+                if isinstance(exit_code, int) and exit_code != 0:
+                    return True
+                return False
+        except Exception:
+            pass
+    head = raw[:300].lower()
+    return '"success": false' in head or '"ok": false' in head
 
 DECIDE_TOOL_SCHEMA: dict[str, Any] = {
     "name": "trismegistus_decide",
@@ -186,6 +266,12 @@ def register(ctx: Any) -> None:
             ctx.state.set(f"force_s2:{session_id}", True)
         verdict = registry.get(session_id)
         if verdict is not None:
+            if verdict.initial_effective_tier == "system1" and verdict.turn_outcome == "clean":
+                verdict.turn_outcome = "false_s1_escalated"
+                try:
+                    record_turn_outcome(verdict.turn_id, verdict.turn_outcome)
+                except Exception:
+                    pass
             verdict.effective_tier = "system2"
             verdict.effective_effort = "xhigh"
             verdict.sticky_override = True
@@ -227,12 +313,8 @@ def register(ctx: Any) -> None:
 
         mode = str(ctx.get_config("mode", default="shadow") or "shadow").strip()
         if mode != "shadow" and verdict.effective_tier == "system2" and verdict.needs_plan_prob >= 0.85:
-            return {
-                "context": (
-                    "[Trismegistus System-2 Note: High structural complexity detected "
-                    f"(p={verdict.needs_plan_prob:.2f}). Verify assumptions before mutating files.]"
-                )
-            }
+            # Constant string (no variable float) so prompt prefix caches stay warm across turns.
+            return {"context": _CONSTANT_SYSTEM2_PLAN_NOTE}
         return None
 
     def on_pre_tool_call(
@@ -273,30 +355,49 @@ def register(ctx: Any) -> None:
         err_key = f"err_streak:{session_id}"
         read_key = f"read_streak:{session_id}"
         phase_key = f"last_phase:{session_id}"
+        chars_key = f"last_read_chars:{session_id}"
+        complex_key = f"last_read_complex:{session_id}"
 
-        head = str(result or "")[:500]
-        is_error = status == "error" or '"error":' in head or '"success": false' in head.lower()
+        is_error = _is_tool_result_error(tool_name, result, status)
         current_err = int(ctx.state.get(err_key, default=0) or 0)
         if is_error:
-            ctx.state.set(err_key, current_err + 1)
+            new_err = current_err + 1
+            ctx.state.set(err_key, new_err)
             ctx.state.set(read_key, 0)
             ctx.state.set(phase_key, "verify_or_act")
+            ctx.state.set(chars_key, 0)
+            ctx.state.set(complex_key, False)
+            err_cap = max(1, int(ctx.get_config("escalate_after_errors", default=2) or 2))
+            if new_err >= err_cap:
+                verdict = registry.get(session_id)
+                if verdict is not None and verdict.initial_effective_tier == "system1" and verdict.turn_outcome == "clean":
+                    verdict.turn_outcome = "false_s1_err_streak"
+                    try:
+                        record_turn_outcome(verdict.turn_id, verdict.turn_outcome)
+                    except Exception:
+                        pass
             return
 
         ctx.state.set(err_key, 0)
         if tool_name in READ_ONLY_SCOUT_TOOLS:
             cur_reads = int(ctx.state.get(read_key, default=0) or 0)
+            result_str = str(result or "")
             ctx.state.set(read_key, cur_reads + 1)
             ctx.state.set(phase_key, "scout")
+            ctx.state.set(chars_key, len(result_str))
+            ctx.state.set(complex_key, bool(_STACKTRACE_RE.search(result_str[:4000])))
         else:
             ctx.state.set(read_key, 0)
             ctx.state.set(phase_key, "verify_or_act")
+            ctx.state.set(chars_key, 0)
+            ctx.state.set(complex_key, False)
 
     def on_pre_verify(
         coding: bool = False,
         attempt: int = 0,
         final_response: str = "",
         changed_paths: list[str] | None = None,
+        session_id: str = "",
         **kwargs: Any,
     ) -> dict[str, str] | None:
         del kwargs
@@ -312,6 +413,14 @@ def register(ctx: Any) -> None:
             final_response=final_response,
         )
         if verified_p < 0.35:
+            if session_id:
+                verdict = registry.get(session_id)
+                if verdict is not None and verdict.initial_effective_tier == "system1" and verdict.turn_outcome == "clean":
+                    verdict.turn_outcome = "false_s1_verify_failed"
+                    try:
+                        record_turn_outcome(verdict.turn_id, verdict.turn_outcome)
+                    except Exception:
+                        pass
             return {
                 "action": "continue",
                 "message": (
@@ -368,14 +477,7 @@ def register(ctx: Any) -> None:
         if verdict is None:
             return
         mode = str(ctx.get_config("mode", default="shadow") or "shadow")
-        in_tok = 0
-        out_tok = 0
-        if isinstance(usage, dict):
-            in_tok = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
-            out_tok = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
-        elif usage is not None:
-            in_tok = int(getattr(usage, "input_tokens", 0) or 0)
-            out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+        in_tok, out_tok, cache_read, cache_write, reasoning_tok = _extract_usage_metrics(usage)
         try:
             record_turn_completion(
                 verdict=verdict,
@@ -383,6 +485,9 @@ def register(ctx: Any) -> None:
                 provider_duration_ms=float(api_duration or 0.0) * 1000.0,
                 provider_input_tokens=in_tok,
                 provider_output_tokens=out_tok,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
+                reasoning_tokens=reasoning_tok,
             )
         except Exception:
             pass
@@ -402,5 +507,5 @@ def register(ctx: Any) -> None:
             ctx, raw_args, session_id=session_id
         ),
         description="Inspect or switch Trismegistus System-1 / System-2 cognitive routing",
-        args_hint="[status|stats|last|mode <shadow|effort_only|tier_and_effort>|escalate]",
+        args_hint="[status|stats|last|outcomes|calibrate|mode <shadow|effort_only|tier_and_effort>|escalate]",
     )

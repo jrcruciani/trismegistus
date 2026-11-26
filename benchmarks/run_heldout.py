@@ -425,6 +425,11 @@ def run_benchmark(
     confidence_threshold: float = 0.82,
     trap_risk_threshold: float = 0.50,
     limit: int | None = None,
+    calibrate: bool = False,
+    target_alpha: float = 0.02,
+    apply_calibration: bool = False,
+    save_calibration_path: Path | None = None,
+    include_predictions: bool = False,
 ) -> dict[str, Any]:
     pkg = _load_trismegistus_pkg()
     pkg.backends.clear_backend_caches()
@@ -454,6 +459,9 @@ def run_benchmark(
         "trap_risk_threshold": trap_risk_threshold,
         "triage_cache_ttl_seconds": 0.0,
         "max_retry_wait_seconds": 2.0,
+        "use_calibrated_thresholds": False,
+        "closed_loop_enabled": False,
+        "fast_path_enabled": False,
     }
 
     ready, detail = preflight_backend(pkg, backend, settings)
@@ -543,12 +551,29 @@ def run_benchmark(
         if key_ctx is not None:
             key_ctx.stop()
 
-    return compute_benchmark_metrics(
+    report = compute_benchmark_metrics(
         results,
         backend=backend,
         execution_kind="offline_wire_harness" if is_offline else "live_backend",
         dataset_path=dataset_path,
     )
+    if calibrate:
+        cal_backend = "foundry_systemone" if is_offline else backend
+        cal_profile = pkg.calibration.calibrate_thresholds(
+            results,
+            backend=cal_backend,
+            target_alpha=target_alpha,
+        )
+        report["conformal_calibration"] = cal_profile.to_dict()
+        if apply_calibration or save_calibration_path is not None:
+            saved_to = pkg.calibration.save_calibration_profile(
+                cal_profile,
+                path=save_calibration_path,
+            )
+            report["conformal_calibration_saved_to"] = str(saved_to)
+    if include_predictions:
+        report["predictions"] = results
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -567,6 +592,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--confidence-threshold", type=float, default=0.82)
     parser.add_argument("--trap-risk-threshold", type=float, default=0.50)
     parser.add_argument("--limit", type=int, default=0, help="Optional cap on number of items (0 = all 300).")
+    parser.add_argument("--calibrate", action="store_true", help="Compute split-conformal thresholds from the evaluated turns.")
+    parser.add_argument("--target-alpha", type=float, default=0.02, help="Max target false_fast_route_rate for conformal calibration.")
+    parser.add_argument("--apply-calibration", action="store_true", help="Persist conformal calibration profile into active HERMES_HOME plugin-data.")
+    parser.add_argument("--save-calibration", type=Path, default=None, help="Write conformal calibration profile to an explicit JSON path.")
+    parser.add_argument("--dump-predictions", action="store_true", help="Include per-turn raw verdicts in JSON output.")
     parser.add_argument("--audit-ledger", type=Path, default=None, help="Audit and deduplicate an existing SQLite ledger.db read-only.")
     parser.add_argument("--output", type=Path, default=None, help="Write JSON report to file.")
     args = parser.parse_args(argv)
@@ -585,6 +615,11 @@ def main(argv: list[str] | None = None) -> int:
             confidence_threshold=args.confidence_threshold,
             trap_risk_threshold=args.trap_risk_threshold,
             limit=args.limit or None,
+            calibrate=args.calibrate,
+            target_alpha=args.target_alpha,
+            apply_calibration=args.apply_calibration,
+            save_calibration_path=args.save_calibration,
+            include_predictions=args.dump_predictions,
         )
 
     serialized = json.dumps(report, indent=2, ensure_ascii=False)

@@ -4,7 +4,7 @@
   "backend": "offline_wire_harness",
   "mode_enforced": "shadow",
   "shadow_mutations_detected": 0,
-  "dataset": "benchmarks/heldout_300.jsonl",
+  "dataset": "/root/.hermes/profiles/prometeo/cache/scratch/trismegistus/benchmarks/heldout_300.jsonl",
   "independent_turns_evaluated": 300,
   "overall_effective_accuracy": 0.9667,
   "precision_by_regime": {
@@ -56,8 +56,8 @@
       ],
       "abstained_count": 29,
       "abstained_rate": 0.29,
-      "trap_blocked_count": 32,
-      "trap_blocked_rate": 0.32
+      "trap_blocked_count": 30,
+      "trap_blocked_rate": 0.3
     }
   },
   "routing_risk_metrics": {
@@ -79,14 +79,14 @@
   "abstention_and_guards": {
     "abstained_total": 39,
     "abstention_rate": 0.13,
-    "trap_blocked_total": 32,
-    "trap_guard_rate": 0.1067
+    "trap_blocked_total": 30,
+    "trap_guard_rate": 0.1
   },
   "latency_ms": {
-    "p50": 0.12,
+    "p50": 0.13,
     "p95": 0.18,
-    "p99": 0.23,
-    "mean": 0.13
+    "p99": 0.21,
+    "mean": 0.14
   },
   "errors": {
     "error_turns": 0,
@@ -96,8 +96,22 @@
     }
   },
   "cost": {
-    "decision_input_tokens": 156749,
+    "decision_input_tokens": 172189,
     "decision_output_tokens": 0,
-    "estimated_foundry_cost_usd": 0.006583
+    "estimated_foundry_cost_usd": 0.007232
+  },
+  "conformal_calibration": {
+    "backend": "foundry_systemone",
+    "confidence_threshold": 0.78,
+    "trap_risk_threshold": 0.5,
+    "target_alpha": 0.02,
+    "n_total": 300,
+    "n_must_s2": 200,
+    "n_s1": 100,
+    "empirical_false_fast_route_rate": 0.0,
+    "wilson95_false_fast_route_upper": 0.0188,
+    "conformal_risk_bound": 0.005,
+    "achieved_s1_recall": 1.0,
+    "updated_at": 1795724610.3655431
   }
 }

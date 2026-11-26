@@ -9,6 +9,13 @@ import uuid
 QuestionType = Literal["noul", "choice", "score"]
 CognitiveTier = Literal["system1", "system2"]
 EffortLevel = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
+TurnOutcome = Literal[
+    "clean",
+    "false_s1_err_streak",
+    "false_s1_escalated",
+    "false_s1_verify_failed",
+    "s2_fast_simple",
+]
 
 # 5-level precision effort scale mapped onto score indices 0..4
 EFFORT_LADDER: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
@@ -119,6 +126,7 @@ class DecisionBatchResult:
     output_tokens: int = 0
     error: str | None = None
     cached: bool = False
+    failover_used: bool = False
 
     @property
     def ok(self) -> bool:
@@ -153,9 +161,26 @@ class TriageVerdict:
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
     recorded_steps: int = 0
     cached: bool = False
+    fast_pathed: bool = False
+    fast_path_reason: str = ""
+    multimodal: bool = False
+    failover_used: bool = False
+    initial_effective_tier: CognitiveTier = "system2"
+    turn_outcome: TurnOutcome = "clean"
+    calibration_source: str = "config"
+    applied_conf_threshold: float = 0.82
+    applied_trap_threshold: float = 0.50
+
+    def __post_init__(self) -> None:
+        if not self.initial_effective_tier:
+            self.initial_effective_tier = self.effective_tier
 
     def summary_tag(self) -> str:
         flags: list[str] = []
+        if self.fast_pathed:
+            flags.append(f"fast_path:{self.fast_path_reason or 's2'}")
+        if self.multimodal:
+            flags.append("multimodal")
         if self.abstained:
             flags.append("abstained->s2")
         if self.trap_blocked:
@@ -170,6 +195,8 @@ class TriageVerdict:
             flags.append("wire_guard")
         if self.cached:
             flags.append("cached")
+        if self.failover_used:
+            flags.append("failover")
         if self.error:
             flags.append("fallback_err")
         suffix = f" [{'|'.join(flags)}]" if flags else ""

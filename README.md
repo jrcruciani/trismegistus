@@ -1,52 +1,54 @@
-# Trismegistus (`v0.2.2`)
+# Trismegistus (`v0.3.0`)
 
-**Precision & performance System-1 / System-2 cognitive router for [Hermes Agent](https://github.com/NousResearch/hermes-agent)** (`Triage → Modulation → Call`).
+**Precision & speed System-1 / System-2 cognitive router for [Hermes Agent](https://github.com/NousResearch/hermes-agent)** (`Triage → Modulation → Call`).
 
-> **Reference design:** Trismegistus was designed and tuned for **GitHub Copilot as the execution provider** and **Microsoft Foundry / `Microsoft-Decision-1.1` as the decision backend**. That pairing is the tested fast path: model tiers, reasoning effort, delegation presets, and wire-level safeguards encode Copilot behavior, while non-Copilot execution providers fall back to **safe passthrough** (never injecting Copilot model IDs or incompatible reasoning fields, and still enforcing signed replay-carrier guards).
+> **Design objective:** Precision and wall-clock speed first — never sacrificing correctness or breaking prompt KV cache merely to save tokens.
 >
-> For provider-neutral planning, safe rollout guidance, and the current limitations of OpenAI-compatible, Anthropic, Gemini, Azure, and local endpoints, see [Recommendations for Other Providers](docs/other-providers.md).
+> **Reference design:** Trismegistus was designed and tuned for **GitHub Copilot as the execution provider** and **Microsoft Foundry / `Microsoft-Decision-1.1` as the decision backend** (with optional same-model failover to OpenRouter / Vercel `Microsoft-Decision-1.1`). First-class provider adapters (`providers_adapter.py`) cover Copilot, OpenAI/Azure, Anthropic (cache-safe adaptive thinking), and Gemini, while unknown providers default to **safe passthrough** with universal signed replay-carrier guards.
+>
+> For provider-neutral planning, safe rollout guidance, and multi-provider delegation routes, see [Recommendations for Other Providers](docs/other-providers.md).
 
-The reference configuration pairs **Microsoft-Decision-1.1 on Microsoft Foundry** (`0` output tokens, warm TLS Keep-Alive) with deliberative **frontier models on GitHub Copilot**, without sacrificing accuracy or invalidating prompt KV cache.
+The reference configuration pairs **Microsoft-Decision-1.1 on Microsoft Foundry** (`0` output tokens, warm TLS Keep-Alive, multimodal + 32K context) with deliberative **frontier models on GitHub Copilot**, backed by split-conformal threshold calibration, closed-loop false-S1 hardening, and measured KV-cache telemetry.
 
 ---
 
 ## Architecture: Precision + Speed Across Three Stages
 
 ```text
-1. TRIAGE (System 1, ~60-120ms)    2. MODULATION (KV-Warm & Safe)      3. CALL & SPECIALTY DELEGATION
-───────────────────────────────    ────────────────────────────────    ──────────────────────────────────
-pre_llm_call / pre_tool_call       llm_request middleware              llm_execution + post_api_request
-Warm TLS 1.3 Keep-Alive POST       • 5-rung effort ladder:             • Fail-open entitlement retry
-.../providers/microsoft/v1/          minimal/low/medium/high/xhigh       if a swapped model 400/403s
-    systemone (0 output tokens)    • Dynamic Intra-Turn Step Pacing:   • Pre-Verify QA Gate (default ON):
-  • tier (choice: s1 vs s2)          - Plan/Edit/Synth -> high/xhigh     blocks unverified code claims
-  • effort (score: 0..4 -> xhigh)    - Read-only scouts -> low/medium  • Specialty DelegationProvider:
-  • trap_risk (noul: 0..1)           - Same model = 100% warm KV!        - fast_scout -> gemini-3-flash
-  • needs_plan (noul: 0..1)        • Copilot wire & carrier guards:      - deep_code  -> gpt-5.4 (xhigh)
-• Asymmetric precision floor:        chat_completions vs responses,      - architect  -> claude-sonnet-5
-  conf < 0.82 OR trap >= 0.50        thought_signature / opaque          - long_ctx   -> gemini-3.1-pro
-  -> Veto S1, lock System 2
+1. TRIAGE (System 1, <1ms fast-path / ~110ms warm)   2. MODULATION (KV-Aware & Safe)      3. CALL, DELEGATION & CLOSED-LOOP
+──────────────────────────────────────────────────   ──────────────────────────────────   ───────────────────────────────────
+pre_llm_call / pre_tool_call                         llm_request middleware               llm_execution + post_api_request
+• Sub-ms S2 Fast-Path (active modes):                • ProviderAdapter dispatch:          • Fail-open entitlement retry
+  forced_s2 / err_streak / multi-hunk diffs /          Copilot, OpenAI, Anthropic,          if a swapped model 400/403s
+  stacktraces -> 0ms RTT directly to S2                Gemini, Passthrough                • Pre-Verify QA Gate (default ON)
+• Head+Tail (60/40, 4k chars) + multimodal signals   • Precision-first Step Pacing:       • Closed-Loop Telemetry (ledger.db):
+• Warm TLS 1.3 Keep-Alive + same-model failover        - Paces early small reads (<=2)      cache_read_tokens, cache_hit_rate,
+  Foundry -> OpenRouter / Vercel (Decision-1.1)        - Restores xhigh BEFORE synthesis    reasoning_tokens, false_s1_* signals
+• Split-conformal thresholds + closed-loop guard       - Keeps Claude effort steady to    • Multi-provider Specialty Delegation:
+  per backend (never loosens precision floor)            preserve cache breakpoints         fast_scout / deep_code / arch / long_ctx
 ```
 
 ---
 
-## Key Capabilities & Resilience (`v0.2.2`)
+## Key Capabilities & Resilience (`v0.3.0`)
 
-1. **Zero-Generation Triage + Persistent TLS Keep-Alive (`compat.py` / `backends.py`)**:
-   - `Microsoft-Decision-1.1` evaluates **four orthogonal questions in a single forward pass** (`tier`, `effort`, `trap_risk`, `needs_plan`) with `0` generated tokens (`$0.042 / 1M` input tokens on Foundry).
-   - Thread-safe `KeepAliveHttpPool` reuses warm TLS 1.3 sockets across turns, discards upstream error sockets (`4xx`/`5xx`) so Azure APIM disconnects never poison later requests, and retries transient disconnects cleanly.
-2. **401 / 429 / Secret-Rotation Resilience (`compat.py` / `backends.py`)**:
-   - **Live `.env` & Secret-Scope Refresh**: Single-profile sessions read rotated credentials via `hermes_cli.config.get_env_value_prefer_dotenv` (while multiplexed gateways strictly honor `agent.secret_scope.get_secret` + `refresh_installed_secret_scope`), auto-detect Entra JWTs vs static Foundry API keys (`foundry_auth_header: auto`), pre-check JWT `exp` locally before making wasted 401 network calls, and retry once when an external rotator updates `.env`.
-   - **Rate-Limit Backoff, Cooldown Gate & Triage Cache**: Honors standard `Retry-After` and Foundry `retry-after-ms` / `x-ms-retry-after-ms` headers up to `max_retry_wait_seconds` (`2.0s`) with jitter, enforces per-origin cooldowns on sustained 429s, and caches error-free verdicts across identical repeated prompts (`triage_cache_ttl_seconds: 180s`) so recurring heartbeats spend `0` Foundry tokens.
-   - **Optional Supported Fallback (`fallback_backend`)**: Defaults to `none` (clean fail-open to System 2 without extra LLM calls); can be set to `hermes_aux` (`ctx.llm`) or `local_systemone` / `local_logits`.
-3. **Asymmetric Precision Floor & Hidden-Trap Gate (`triage.py`)**:
-   - Lowering effort is only allowed when **both** `confidence >= 0.82` **and** `trap_risk < 0.50`.
-   - Deceptively short prompts that hide concurrency hazards, state coupling, auth/security invariants, or subtle context dependencies trip `trap_risk` and stay on System 2 (`high`/`xhigh`).
-4. **Turn-Deduplicated SQLite Telemetry & Held-Out 300-Turn Benchmark (`ledger.py` / `benchmarks/`)**:
-   - Multi-step tool loops attribute `decision_latency_ms`, `decision_input_tokens`, and triage errors strictly once per turn (`turn_id` + `step_index`), and `audit_ledger_db` deduplicates legacy pre-`v0.2.2` rows automatically.
-   - Ships `benchmarks/heldout_300.jsonl` (100 `s1`, 100 `s2`, 100 `ambiguous_trap` independent turns) and `benchmarks/run_heldout.py` enforcing `mode: shadow` with Wilson 95% confidence intervals, `false_fast_route_rate`, `false_escalation_rate`, abstention/trap-guard rates, `p50`/`p95` latency, error breakdown, and Foundry spend.
+1. **Zero-Generation Multimodal Triage + Same-Model Failover (`backends.py` / `triage.py`)**:
+   - `Microsoft-Decision-1.1` evaluates **four orthogonal questions in a single forward pass** (`tier`, `effort`, `trap_risk`, `needs_plan`) with `0` generated tokens (`$0.042 / 1M` input tokens).
+   - Preserves **Head + Tail** (60% start + 40% end, default `4000` chars) plus structural signals (`has_images`, `has_stacktrace`, `has_diff`, `has_code_blocks`), forwards bounded image attachments to multimodal Decision-1.1 backends, and vetoes blind S1 downgrades on text-only backends.
+   - Supports **same-model failover** (`secondary_systemone_endpoint`: `'openrouter'`, `'vercel'`, or secondary Foundry URL) on `429`/`401`/timeout without losing probability calibration.
+   - `LocalLogitsBackend` evaluates all questions **concurrently** (`ThreadPoolExecutor`) under a single global wall-clock deadline.
+2. **Sub-Millisecond S2 Fast-Path & Cache-Safe Step Pacing (`triage.py` / `modulation.py`)**:
+   - In active modes, skips triage RTT (`0ms`) when `forced_s2`, `err_streak`, multi-hunk diffs, or stacktrace debug payloads already mandate System 2 (never fast-paths downward to System 1).
+   - **Synthesis-safe Step Pacing**: paces only early small read-only scout steps (`read_streak <= step_pacing_max_reads`, default `2`, `< 6000` chars, no stacktrace) and restores full `high`/`xhigh` effort **before** synthesis/editing; protects Claude prompt-cache breakpoints (`step_pacing_protect_claude_cache: true`); uses constant System-2 context notes with no variable floats.
+   - Robust tool-error detection in `post_tool_call` never misclassifies file contents containing `"error":` from `read_file`/`search_files` as tool failures.
+3. **Split-Conformal Calibration & Closed-Loop Precision Hardening (`calibration.py` / `ledger.py`)**:
+   - Per-backend split-conformal calibration (`python3 benchmarks/run_heldout.py --calibrate --target-alpha 0.02 --apply-calibration`) computes finite-sample risk-controlled `(confidence_threshold, trap_risk_threshold)` profiles stored in `<HERMES_HOME>/plugin-data/trismegistus/calibration.json`.
+   - Closed-loop runtime monitoring tracks implicit false-S1 signals (`false_s1_err_streak`, `false_s1_escalated`, `false_s1_verify_failed`) and conservatively tightens thresholds under distribution shift without ever loosening below the precision floor.
+4. **KV-Cache Telemetry, Provider Adapters & End-to-End Evaluation (`providers_adapter.py` / `benchmarks/`)**:
+   - Records real `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, `cache_hit_rate`, and per-turn `step_paced`/`wire_guarded`/`turn_outcome` flags in `ledger.db`.
+   - Ships de-biased `benchmarks/heldout_300.jsonl` (300 independent turns: `100 s1`, `100 s2`, `100 ambiguous_trap`, 0 self-referential prompts, 65 multi-turn histories) and `benchmarks/run_e2e_eval.py` comparing `baseline_s2`, `effort_only`, and `tier_and_effort` on `pass@1`, wall-clock latency, and KV-cache hit rate.
 5. **Hermes 0.23.x Manifest Compatibility (`plugin.yaml`)**:
-   - Uses the documented unversioned/v1 `plugin.yaml` envelope so `provides_middleware` passes `hermes plugins validate` capability checks while avoiding `plugins_manifest.py` unknown-field warnings on `manifest_version >= 2`, keeping all `config_schema` and `capabilities` declarations active.
+   - Uses the documented unversioned/v1 `plugin.yaml` envelope with zero private-import warnings and full `config_schema` / `capabilities` validation.
 
 ---
 
@@ -86,12 +88,14 @@ python3 benchmarks/run_heldout.py --backend foundry_systemone --pacing-ms 220 --
 
 ## Slash Commands & Tools
 
-- `/trismegistus status` — Active mode, backend/fallback status, Foundry key check, turn-deduplicated S1 / S2 / Trap-guarded counts, p50/p95 latency, error rate, and estimated Foundry spend.
-- `/trismegistus stats` / `/trismegistus last` — Recent unique turns with step counts, confidence, `trap_risk`, triage latency (ms), and applied model/effort.
+- `/trismegistus status` — Active mode, backend/failover status, turn-deduplicated S1 / S2 / Fast-path / Trap-guarded counts, p50/p95 triage latency, KV-cache hit rate, reasoning tokens, error rate, and false-S1 signals.
+- `/trismegistus stats` / `/trismegistus last` — Recent unique turns with step counts, `step_paced`/`wire_guard`/`fast_path` flags, outcome tags, confidence, `trap_risk`, triage latency (ms), and applied model/effort.
+- `/trismegistus outcomes` — Closed-loop false-S1 signal breakdown (`false_s1_err_streak`, `false_s1_escalated`, `false_s1_verify_failed`).
+- `/trismegistus calibrate` — Inspect the active backend's saved split-conformal calibration profile.
 - `/trismegistus mode <shadow|effort_only|tier_and_effort>` — Switch operating mode live.
 - `/trismegistus escalate` — Arm the next turn for System 2 (`xhigh` effort).
 - Tool `trismegistus_decide` — Query `Microsoft-Decision-1.1` (or local backend) directly with `noul`, `choice`, or `score` questions.
-- Tool `trismegistus_escalate` — Self-escalate mid-turn to System 2 (`xhigh` effort).
+- Tool `trismegistus_escalate` — Self-escalate mid-turn to System 2 (`xhigh` effort) and record a closed-loop signal if the turn started in System 1.
 
 ---
 
@@ -110,7 +114,8 @@ python3 benchmarks/run_heldout.py --backend foundry_systemone --pacing-ms 220 --
 python3 tests/run_tests.py
 hermes plugins validate .
 hermes plugins doctor . --ci
-python3 benchmarks/run_heldout.py --backend offline_wire_harness
+python3 benchmarks/run_heldout.py --backend offline_wire_harness --calibrate
+python3 benchmarks/run_e2e_eval.py --mode offline_sim
 ```
 
 ## License
