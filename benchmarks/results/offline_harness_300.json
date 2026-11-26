@@ -1,0 +1,103 @@
+{
+  "status": "completed",
+  "execution_kind": "offline_wire_harness",
+  "backend": "offline_wire_harness",
+  "mode_enforced": "shadow",
+  "shadow_mutations_detected": 0,
+  "dataset": "benchmarks/heldout_300.jsonl",
+  "independent_turns_evaluated": 300,
+  "overall_effective_accuracy": 0.9667,
+  "precision_by_regime": {
+    "system1_precision": 1.0,
+    "system1_recall": 0.9,
+    "system2_precision": 0.9524,
+    "system2_recall_all_must_escalate": 1.0
+  },
+  "per_class": {
+    "s1": {
+      "count": 100,
+      "expected_effective_tier": "system1",
+      "routed_system1": 90,
+      "routed_system2": 10,
+      "class_accuracy": 0.9,
+      "class_accuracy_wilson95": [
+        0.8256,
+        0.9448
+      ],
+      "abstained_count": 10,
+      "abstained_rate": 0.1,
+      "trap_blocked_count": 0,
+      "trap_blocked_rate": 0.0
+    },
+    "s2": {
+      "count": 100,
+      "expected_effective_tier": "system2",
+      "routed_system1": 0,
+      "routed_system2": 100,
+      "class_accuracy": 1.0,
+      "class_accuracy_wilson95": [
+        0.963,
+        1.0
+      ],
+      "abstained_count": 0,
+      "abstained_rate": 0.0,
+      "trap_blocked_count": 0,
+      "trap_blocked_rate": 0.0
+    },
+    "ambiguous_trap": {
+      "count": 100,
+      "expected_effective_tier": "system2",
+      "routed_system1": 0,
+      "routed_system2": 100,
+      "class_accuracy": 1.0,
+      "class_accuracy_wilson95": [
+        0.963,
+        1.0
+      ],
+      "abstained_count": 29,
+      "abstained_rate": 0.29,
+      "trap_blocked_count": 32,
+      "trap_blocked_rate": 0.32
+    }
+  },
+  "routing_risk_metrics": {
+    "false_fast_route_count": 0,
+    "false_fast_route_rate": 0.0,
+    "false_fast_route_wilson95": [
+      0.0,
+      0.0188
+    ],
+    "s2_false_fast_route_rate": 0.0,
+    "ambiguous_trap_false_fast_route_rate": 0.0,
+    "false_escalation_count": 10,
+    "false_escalation_rate": 0.1,
+    "false_escalation_wilson95": [
+      0.0552,
+      0.1744
+    ]
+  },
+  "abstention_and_guards": {
+    "abstained_total": 39,
+    "abstention_rate": 0.13,
+    "trap_blocked_total": 32,
+    "trap_guard_rate": 0.1067
+  },
+  "latency_ms": {
+    "p50": 0.12,
+    "p95": 0.18,
+    "p99": 0.23,
+    "mean": 0.13
+  },
+  "errors": {
+    "error_turns": 0,
+    "error_rate": 0.0,
+    "by_category": {
+      "ok": 300
+    }
+  },
+  "cost": {
+    "decision_input_tokens": 156749,
+    "decision_output_tokens": 0,
+    "estimated_foundry_cost_usd": 0.006583
+  }
+}

@@ -1,4 +1,4 @@
-# Trismegistus (`v0.2.1`)
+# Trismegistus (`v0.2.2`)
 
 **Precision & performance System-1 / System-2 cognitive router for [Hermes Agent](https://github.com/NousResearch/hermes-agent)** (`Triage → Modulation → Call`).
 
@@ -30,30 +30,27 @@ Warm TLS 1.3 Keep-Alive POST       • 5-rung effort ladder:             • Fai
 
 ---
 
-## What Makes v0.2 Both Faster and More Accurate
+## Key Capabilities & Resilience (`v0.2.2`)
 
 1. **Zero-Generation Triage + Persistent TLS Keep-Alive (`compat.py` / `backends.py`)**:
    - `Microsoft-Decision-1.1` evaluates **four orthogonal questions in a single forward pass** (`tier`, `effort`, `trap_risk`, `needs_plan`) with `0` generated tokens (`$0.042 / 1M` input tokens on Foundry).
-   - Thread-safe `KeepAliveHttpPool` reuses warm TLS 1.3 sockets across turns (saving ~80–150 ms per turn), automatically recovers from idle upstream disconnects, and caps triage timeout at `1.2s` (failing open immediately to System 2).
-2. **Asymmetric Precision Floor & Hidden-Trap Gate (`triage.py`)**:
+   - Thread-safe `KeepAliveHttpPool` reuses warm TLS 1.3 sockets across turns, discards upstream error sockets (`4xx`/`5xx`) so Azure APIM disconnects never poison later requests, and retries transient disconnects cleanly.
+2. **401 / 429 / Secret-Rotation Resilience (`compat.py` / `backends.py`)**:
+   - **Live `.env` & Secret-Scope Refresh**: Single-profile sessions read rotated credentials via `hermes_cli.config.get_env_value_prefer_dotenv` (while multiplexed gateways strictly honor `agent.secret_scope.get_secret` + `refresh_installed_secret_scope`), auto-detect Entra JWTs vs static Foundry API keys (`foundry_auth_header: auto`), pre-check JWT `exp` locally before making wasted 401 network calls, and retry once when an external rotator updates `.env`.
+   - **Rate-Limit Backoff, Cooldown Gate & Triage Cache**: Honors standard `Retry-After` and Foundry `retry-after-ms` / `x-ms-retry-after-ms` headers up to `max_retry_wait_seconds` (`2.0s`) with jitter, enforces per-origin cooldowns on sustained 429s, and caches error-free verdicts across identical repeated prompts (`triage_cache_ttl_seconds: 180s`) so recurring heartbeats spend `0` Foundry tokens.
+   - **Optional Supported Fallback (`fallback_backend`)**: Defaults to `none` (clean fail-open to System 2 without extra LLM calls); can be set to `hermes_aux` (`ctx.llm`) or `local_systemone` / `local_logits`.
+3. **Asymmetric Precision Floor & Hidden-Trap Gate (`triage.py`)**:
    - Lowering effort is only allowed when **both** `confidence >= 0.82` **and** `trap_risk < 0.50`.
    - Deceptively short prompts that hide concurrency hazards, state coupling, auth/security invariants, or subtle context dependencies trip `trap_risk` and stay on System 2 (`high`/`xhigh`).
-3. **5-Rung Effort Ladder Unlocking `xhigh` (`copilot_lanes.py`)**:
-   - Unlocks `xhigh` reasoning on `gpt-5.4` (`/responses`), `claude-sonnet-5` (`/chat/completions`), and `gpt-6*`, while clamping `minimal -> low` on `/responses` so Copilot never returns HTTP 400.
-4. **Dynamic Intra-Turn Step Pacing (`modulation.py`)**:
-   - In multi-step agent loops (`effort_only` mode), Step 1 plans at full `high`/`xhigh` effort; intermediate read-only scout iterations (`read_file`, `search_files`) pace down to `medium`/`low` on the **exact same model** (preserving **100% warm prompt KV cache** while cutting 5–12s of redundant hidden thinking per file read); and any `patch`, `write_file`, `terminal` call, or tool error **immediately restores full `high`/`xhigh` precision**.
-5. **4-Way Cognitive Specialty Routing for `delegate_task` (`delegation.py`)**:
-   - Because each `delegate_task` child runs in its own isolated `AIAgent`, Trismegistus matches subagents to the best Copilot model for each cognitive profile:
-     - `fast_scout` → `gemini-3-flash-preview` (`low` effort)
-     - `deep_code` → `gpt-5.4` (`xhigh` effort)
-     - `architecture` → `claude-sonnet-5` (`high` effort)
-     - `long_context` → `gemini-3.1-pro-preview` (`high` effort)
-6. **Default-On Code Verification Gate (`pre_verify`)**:
-   - When code files were modified in a turn (in `effort_only` or `tier_and_effort` mode), `Microsoft-Decision-1.1` checks whether the final response reports real verification evidence (`pytest`, CLI run, syntax check) and nudges the agent once before stopping if missing.
+4. **Turn-Deduplicated SQLite Telemetry & Held-Out 300-Turn Benchmark (`ledger.py` / `benchmarks/`)**:
+   - Multi-step tool loops attribute `decision_latency_ms`, `decision_input_tokens`, and triage errors strictly once per turn (`turn_id` + `step_index`), and `audit_ledger_db` deduplicates legacy pre-`v0.2.2` rows automatically.
+   - Ships `benchmarks/heldout_300.jsonl` (100 `s1`, 100 `s2`, 100 `ambiguous_trap` independent turns) and `benchmarks/run_heldout.py` enforcing `mode: shadow` with Wilson 95% confidence intervals, `false_fast_route_rate`, `false_escalation_rate`, abstention/trap-guard rates, `p50`/`p95` latency, error breakdown, and Foundry spend.
+5. **Hermes 0.23.x Manifest Compatibility (`plugin.yaml`)**:
+   - Uses the documented unversioned/v1 `plugin.yaml` envelope so `provides_middleware` passes `hermes plugins validate` capability checks while avoiding `plugins_manifest.py` unknown-field warnings on `manifest_version >= 2`, keeping all `config_schema` and `capabilities` declarations active.
 
 ---
 
-## Installation & Quickstart
+## Installation & Safe Shadow Rollout
 
 ```bash
 # Install from GitHub into your active Hermes profile
@@ -63,14 +60,16 @@ hermes plugins install jrcruciani/trismegistus --enable
 hermes plugins config trismegistus
 ```
 
-Recommended configuration for **maximum precision + speed** (`effort_only` + specialty subagent routing):
+Start in **`shadow` mode** (the default) and validate calibration with the 300-turn held-out benchmark before enabling active modulation:
 
 ```bash
 hermes config set plugins.entries.trismegistus.settings.backend foundry_systemone
 hermes config set plugins.entries.trismegistus.settings.foundry_endpoint "https://<your-resource>.services.ai.azure.com"
 hermes config set plugins.entries.trismegistus.settings.foundry_deployment "microsoft-decision-1.1"
-hermes config set plugins.entries.trismegistus.settings.mode effort_only
-hermes config set delegation.backend trismegistus
+hermes config set plugins.entries.trismegistus.settings.mode shadow
+
+# Run the 300-turn held-out shadow benchmark (~$0.007 total on Foundry)
+python3 benchmarks/run_heldout.py --backend foundry_systemone --pacing-ms 220 --output benchmarks/results/foundry_heldout_300.json
 ```
 
 ---
@@ -79,16 +78,16 @@ hermes config set delegation.backend trismegistus
 
 | Mode | What it mutates | KV Prompt Cache | Best for |
 |---|---|---|---|
-| `shadow` *(default)* | Nothing — records System-1 verdicts, trap scores & latencies | 100% untouched | Auditing calibration on your workload |
-| `effort_only` *(recommended)* | Modulates `minimal..xhigh` effort + intra-turn step pacing on the active model | **100% warm** across every step | **Highest precision + fastest multi-step loops** (`gpt-5.4`, `claude-sonnet-5`, `gemini-4-carbon`) |
+| `shadow` *(default)* | Nothing — records System-1 verdicts, trap scores & latencies | 100% untouched | Auditing calibration & error rates before rollout |
+| `effort_only` | Modulates `minimal..xhigh` effort + intra-turn step pacing on the active model | **100% warm** across every step | **Highest precision + fastest multi-step loops** once Foundry error rate < 1% |
 | `tier_and_effort` | Swaps wire-compatible Copilot models (`claude-haiku-4.5` ↔ `claude-sonnet-5`, `gpt-5.4-mini` ↔ `gpt-5.4`) + effort | Warm within sticky System-2 turns | Extra Copilot premium-request savings on trivial turns |
 
 ---
 
 ## Slash Commands & Tools
 
-- `/trismegistus status` — Active mode, step-pacing & keep-alive status, Foundry key check, and System-1 / System-2 / Trap-guarded / Step-paced counts + estimated Foundry spend.
-- `/trismegistus stats` / `/trismegistus last` — Recent decisions with confidence, `trap_risk`, triage latency (ms), and applied model/effort.
+- `/trismegistus status` — Active mode, backend/fallback status, Foundry key check, turn-deduplicated S1 / S2 / Trap-guarded counts, p50/p95 latency, error rate, and estimated Foundry spend.
+- `/trismegistus stats` / `/trismegistus last` — Recent unique turns with step counts, confidence, `trap_risk`, triage latency (ms), and applied model/effort.
 - `/trismegistus mode <shadow|effort_only|tier_and_effort>` — Switch operating mode live.
 - `/trismegistus escalate` — Arm the next turn for System 2 (`xhigh` effort).
 - Tool `trismegistus_decide` — Query `Microsoft-Decision-1.1` (or local backend) directly with `noul`, `choice`, or `score` questions.
@@ -98,9 +97,9 @@ hermes config set delegation.backend trismegistus
 
 ## Privacy & Security Disclosure (Hermes Plugin Catalog Rule 13)
 
-- **Network calls**: When `backend` is `foundry_systemone` (and `TRISMEGISTUS_FOUNDRY_API_KEY` + `foundry_endpoint` are configured), Trismegistus sends a force-redacted excerpt of the current user turn (`max_excerpt_chars`, default 2,400 chars) and a short tail digest (up to 800 chars) over a verified TLS 1.3 connection (`KeepAliveHttpPool`, no cross-origin redirect forwarding) to `<foundry_endpoint>/providers/microsoft/v1/systemone` on every turn (`shadow` mode included), plus redacted tool arguments / changed file paths when `tool_gate_enabled` or `verify_gate_enabled` run. With `local_systemone` or `local_logits`, requests go only to your configured `local_endpoint`. With `hermes_aux`, calls route through Hermes's host-owned `ctx.llm` on `auxiliary.trismegistus_decider`.
-- **Secret handling**: Secrets (`TRISMEGISTUS_FOUNDRY_API_KEY`, `TRISMEGISTUS_LOCAL_API_KEY`) are read exclusively via `agent.secret_scope.get_secret`, and all outbound text is scrubbed with `agent.redact.redact_sensitive_text(..., force=True)`.
-- **Local storage**: Writes non-message telemetry metrics (timestamps, tier, effort, confidence, `trap_risk`, latencies, model IDs — never prompt text) to `<HERMES_HOME>/plugin-data/trismegistus/ledger.db`.
+- **Network calls**: When `backend` is `foundry_systemone` (and `TRISMEGISTUS_FOUNDRY_API_KEY` + `foundry_endpoint` are configured), Trismegistus sends a force-redacted excerpt of the current user turn (`max_excerpt_chars`, default 2,400 chars) and a short tail digest (up to 800 chars) over a verified TLS 1.3 connection (`KeepAliveHttpPool`, no cross-origin redirect forwarding) to `<foundry_endpoint>/providers/microsoft/v1/systemone` once per user turn (`shadow` mode included), plus redacted tool arguments / changed file paths when `tool_gate_enabled` or `verify_gate_enabled` run in active modes. With `local_systemone` or `local_logits`, requests go only to your configured `local_endpoint`. With `hermes_aux`, calls route through Hermes's host-owned `ctx.llm` on `auxiliary.trismegistus_decider`.
+- **Secret handling**: Secrets (`TRISMEGISTUS_FOUNDRY_API_KEY`, `TRISMEGISTUS_LOCAL_API_KEY`) are read exclusively via Hermes's documented secret APIs (`agent.secret_scope` / `hermes_cli.config.get_env_value_prefer_dotenv`), never from raw credential files, and all outbound text is scrubbed with `agent.redact.redact_sensitive_text(..., force=True)`.
+- **Local storage**: Writes non-message telemetry metrics (timestamps, `turn_id`, `step_index`, tier, effort, confidence, `trap_risk`, latencies, model IDs — never prompt text) to `<HERMES_HOME>/plugin-data/trismegistus/ledger.db`.
 - **No core overrides**: Uses only documented Hermes public plugin APIs; compatible with `plugins.isolation: host`.
 
 ---
@@ -108,9 +107,10 @@ hermes config set delegation.backend trismegistus
 ## Development & Validation
 
 ```bash
-pytest -v
+python3 tests/run_tests.py
 hermes plugins validate .
 hermes plugins doctor . --ci
+python3 benchmarks/run_heldout.py --backend offline_wire_harness
 ```
 
 ## License

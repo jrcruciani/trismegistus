@@ -8,9 +8,11 @@ Every Hermes import in this module comes strictly from the documented Public Plu
 
 from __future__ import annotations
 
+import base64
 from collections import deque
 import http.client
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -18,6 +20,7 @@ import sqlite3
 import ssl
 import tempfile
 import threading
+import time
 from typing import Any, Callable
 import urllib.error
 import urllib.parse
@@ -29,6 +32,8 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}"),
     re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,\"']{8,}"),
 )
+
+_JWT_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def redact_text(text: str) -> str:
@@ -54,16 +59,84 @@ def redact_text(text: str) -> str:
         return out
 
 
-def read_secret(env_name: str) -> str:
-    """Read a plugin secret through Hermes's profile-scoped secret resolver."""
-    try:
-        from agent.secret_scope import get_secret
+def read_secret(env_name: str, *, refresh: bool = False) -> str:
+    """Read a plugin secret through Hermes's supported profile-scoped resolvers.
 
-        val = get_secret(env_name)
-        return str(val or "").strip()
+    - Under multiplexed / routed profiles (`serves_routed_profile() == True`), reads strictly
+      through `agent.secret_scope.get_secret` (refreshing the bound profile scope first when
+      `refresh=True`).
+    - Under single-profile CLI/TUI sessions (`serves_routed_profile() == False`), prefers
+      `hermes_cli.config.get_env_value_prefer_dotenv` so rotated tokens written to `<HERMES_HOME>/.env`
+      beat stale `os.environ` values inherited at process startup (while still honoring `op://`
+      external secret sources).
+    """
+    try:
+        from agent.secret_scope import (
+            get_secret,
+            invalidate_env_file_cache,
+            refresh_installed_secret_scope,
+            serves_routed_profile,
+        )
+
+        if refresh:
+            invalidate_env_file_cache()
+            try:
+                from hermes_constants import get_hermes_home
+
+                refresh_installed_secret_scope(get_hermes_home())
+            except Exception:
+                pass
+
+        if serves_routed_profile():
+            return str(get_secret(env_name) or "").strip()
+
+        try:
+            from hermes_cli.config import get_env_value_prefer_dotenv
+
+            preferred = get_env_value_prefer_dotenv(env_name)
+            if preferred is not None and str(preferred).strip():
+                return str(preferred).strip()
+        except Exception:
+            pass
+
+        return str(get_secret(env_name) or "").strip()
     except ImportError:
         # Standalone pytest fallback outside the Hermes runtime
         return str(os.getenv(env_name) or "").strip()
+
+
+def is_jwt_token(value: str) -> bool:
+    """Return True when `value` has standard 3-segment OAuth2/Entra JWT structure (`eyJ...`)."""
+    raw = str(value or "").strip()
+    if not raw.startswith("eyJ"):
+        return False
+    parts = raw.split(".")
+    if len(parts) != 3:
+        return False
+    return all(bool(p) and bool(_JWT_SEGMENT_RE.match(p)) for p in parts)
+
+
+def jwt_seconds_until_expiry(value: str, *, now: float | None = None) -> float | None:
+    """Inspect only the numeric `exp` claim of a JWT in memory (never logging or storing it).
+
+    Returns remaining seconds (`exp - now`), or `None` if `value` is not a JWT with an `exp` claim.
+    """
+    if not is_jwt_token(value):
+        return None
+    payload_seg = value.strip().split(".")[1]
+    padded = payload_seg + ("=" * (-len(payload_seg) % 4))
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        claims = json.loads(decoded.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(claims, dict):
+        return None
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)):
+        return None
+    ref = time.time() if now is None else float(now)
+    return float(exp) - ref
 
 
 def user_agent() -> str:
@@ -71,9 +144,9 @@ def user_agent() -> str:
     try:
         from hermes_cli.version_info import hermes_user_agent
 
-        return hermes_user_agent("trismegistus/0.2.1")
+        return hermes_user_agent("trismegistus/0.2.2")
     except ImportError:
-        return "Hermes-Trismegistus/0.2.1"
+        return "Hermes-Trismegistus/0.2.2"
 
 
 class _BytesHttpResponse:
@@ -97,11 +170,11 @@ class _BytesHttpResponse:
 class KeepAliveHttpPool:
     """Thread-safe HTTP/1.1 Keep-Alive pool eliminating ~80-150 ms TLS handshakes to Foundry.
 
-    Security properties:
+    Security & reliability properties:
     - Uses verified default `ssl.SSLContext` for `https://`.
     - Never forwards credentials across origins (redirects are not auto-followed).
-    - Automatically discards stale idle sockets closed by upstream load balancers and retries
-      transparently once on a fresh connection.
+    - Discards sockets after auth/rate-limit/5xx error responses so upstream APIM disconnects
+      never poison subsequent requests, and transparently retries stale idle sockets once.
     """
 
     def __init__(self, max_per_origin: int = 4, connection_factory: Callable[..., Any] | None = None) -> None:
@@ -178,8 +251,11 @@ class KeepAliveHttpPool:
                 status = int(resp.status)
                 resp_headers = resp.headers
                 will_close = (
-                    hasattr(resp_headers, "get")
-                    and str(resp_headers.get("Connection") or "").lower() == "close"
+                    status >= 400
+                    or (
+                        hasattr(resp_headers, "get")
+                        and str(resp_headers.get("Connection") or "").lower() == "close"
+                    )
                 )
                 if will_close:
                     conn.close()
@@ -261,29 +337,45 @@ def open_safe_url(
         return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - standalone fallback
 
 
-def parse_retry_after(headers: Any) -> float | None:
-    """Parse Foundry's non-standard `retry-after-ms` or standard `Retry-After`."""
+def _header_get_ci(headers: Any, name: str) -> str | None:
     if headers is None:
         return None
-    ms_val = headers.get("retry-after-ms") if hasattr(headers, "get") else None
-    if ms_val is not None:
-        try:
-            ms = float(str(ms_val).strip())
-            if ms >= 0:
-                return min(ms / 1000.0, 2.0)
-        except ValueError:
-            pass
-    ra_val = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if hasattr(headers, "get"):
+        direct = headers.get(name)
+        if direct is not None:
+            return str(direct)
+    if hasattr(headers, "items"):
+        target = name.lower()
+        for k, v in headers.items():
+            if str(k).lower() == target and v is not None:
+                return str(v)
+    return None
+
+
+def parse_retry_after(headers: Any, *, max_cap: float = 30.0) -> float | None:
+    """Parse Foundry's `retry-after-ms` / `x-ms-retry-after-ms` or standard `Retry-After`."""
+    if headers is None:
+        return None
+    for ms_header in ("retry-after-ms", "x-ms-retry-after-ms"):
+        ms_val = _header_get_ci(headers, ms_header)
+        if ms_val is not None:
+            try:
+                ms = float(ms_val.strip())
+                if ms >= 0:
+                    return min(ms / 1000.0, max_cap)
+            except ValueError:
+                pass
+    ra_val = _header_get_ci(headers, "Retry-After")
     if ra_val is not None:
         try:
             from agent.retry_utils import parse_retry_after_seconds
 
-            parsed = parse_retry_after_seconds(str(ra_val))
+            parsed = parse_retry_after_seconds(ra_val)
             if parsed is not None:
-                return min(float(parsed), 2.0)
+                return min(max(0.0, float(parsed)), max_cap)
         except ImportError:
             try:
-                return min(float(str(ra_val).strip()), 2.0)
+                return min(max(0.0, float(ra_val.strip())), max_cap)
             except ValueError:
                 return None
     return None

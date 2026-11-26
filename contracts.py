@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Literal
+import uuid
 
 QuestionType = Literal["noul", "choice", "score"]
 CognitiveTier = Literal["system1", "system2"]
@@ -117,6 +118,7 @@ class DecisionBatchResult:
     input_tokens: int = 0
     output_tokens: int = 0
     error: str | None = None
+    cached: bool = False
 
     @property
     def ok(self) -> bool:
@@ -148,6 +150,9 @@ class TriageVerdict:
     applied_model: str = ""
     applied_effort: str = ""
     wire_guarded: bool = False
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
+    recorded_steps: int = 0
+    cached: bool = False
 
     def summary_tag(self) -> str:
         flags: list[str] = []
@@ -163,6 +168,8 @@ class TriageVerdict:
             flags.append("err_streak->s2")
         if self.wire_guarded:
             flags.append("wire_guard")
+        if self.cached:
+            flags.append("cached")
         if self.error:
             flags.append("fallback_err")
         suffix = f" [{'|'.join(flags)}]" if flags else ""

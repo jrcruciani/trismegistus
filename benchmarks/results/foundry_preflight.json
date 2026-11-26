@@ -1,0 +1,14 @@
+{
+  "status": "blocked",
+  "execution_kind": "live_preflight_blocked",
+  "backend": "foundry_systemone",
+  "mode_enforced": "shadow",
+  "dataset": "benchmarks/heldout_300.jsonl",
+  "dataset_verified_turns": 300,
+  "dataset_class_counts": {
+    "s1": 100,
+    "s2": 100,
+    "ambiguous_trap": 100
+  },
+  "blocker": "foundry_endpoint setting is empty in active profile; TRISMEGISTUS_FOUNDRY_API_KEY secret is not set in active profile"
+}

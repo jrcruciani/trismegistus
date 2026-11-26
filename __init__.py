@@ -8,8 +8,8 @@ Stages:
      Adjusts `reasoning_effort` / `reasoning.effort` and wire-compatible GitHub Copilot models
      while preserving KV prompt caching and signed reasoning replay carriers.
   3. Call & Delegation (`llm_execution` middleware, `post_api_request`, `DelegationProvider`):
-     Executes with fail-open entitlement recovery, records telemetry to a profile-scoped SQLite
-     ledger, and routes `delegate_task` subagents across System-1 / System-2 Copilot models.
+     Executes with fail-open entitlement recovery, records turn-deduplicated telemetry to a
+     profile-scoped SQLite ledger, and routes `delegate_task` subagents across System-1 / System-2 Copilot models.
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ from .triage import (
     evaluate_verify_gate,
     run_turn_triage,
 )
+
+__version__ = "0.2.2"
 
 DECIDE_TOOL_SCHEMA: dict[str, Any] = {
     "name": "trismegistus_decide",
@@ -134,7 +136,7 @@ def _handle_decide_tool(ctx: Any, params: dict[str, Any]) -> str:
                 "backend": batch.backend,
                 "model": batch.model,
                 "latency_ms": round(batch.latency_ms, 1),
-                "error": batch.error or "No answer returned",
+                "error": redact_text(str(batch.error or "No answer returned")[:240]),
             }
         )
 

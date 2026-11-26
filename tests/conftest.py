@@ -36,4 +36,6 @@ def pkg():
 @pytest.fixture(autouse=True)
 def isolated_hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mod = load_trismegistus_package()
+    mod.backends.clear_backend_caches()
     return tmp_path

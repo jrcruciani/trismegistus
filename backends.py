@@ -3,8 +3,9 @@
 1. `SystemOneHttpBackend` (`foundry_systemone` / `local_systemone`):
    Speaks the native System One HTTP protocol (`POST .../providers/microsoft/v1/systemone` on
    Microsoft Foundry for `Microsoft-Decision-1.1`, or `.../v1/systemone` for `open-jev`).
-   Uses persistent TLS Keep-Alive connections by default, sends explicit `Content-Length`, and
-   handles Foundry's `retry-after-ms`.
+   Uses persistent TLS Keep-Alive connections by default, sends explicit `Content-Length`,
+   handles Foundry's `retry-after-ms` / `Retry-After` with pacing cooldowns, refreshes rotated
+   profile secrets on 401 / expired Entra JWTs, and caches identical repeated triage payloads.
 2. `LocalLogitsBackend` (`local_logits`):
    Calls any local OpenAI-compatible inference engine (`llama-server`, `vLLM`, `Ollama`) with
    `max_tokens=1, logprobs=True, top_logprobs=10, temperature=0.0` for calibrated softmax probabilities.
@@ -14,15 +15,81 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from dataclasses import replace
+import hashlib
 import json
 import math
+import random
+import threading
 import time
 from typing import Any, Callable, Mapping
 import urllib.error
 import urllib.request
 
-from .compat import open_safe_url, parse_retry_after, read_secret, user_agent
+from .compat import (
+    is_jwt_token,
+    jwt_seconds_until_expiry,
+    open_safe_url,
+    parse_retry_after,
+    read_secret,
+    user_agent,
+)
 from .contracts import DecisionAnswer, DecisionBatchResult, DecisionQuestion
+
+_CACHE_LOCK = threading.Lock()
+_DECISION_CACHE: OrderedDict[str, tuple[float, DecisionBatchResult]] = OrderedDict()
+_DECISION_CACHE_MAX = 256
+
+_RATE_LOCK = threading.Lock()
+_RATE_LIMIT_UNTIL: dict[str, float] = {}
+_AUTH_COOLDOWN_UNTIL: dict[tuple[str, str], tuple[float, str]] = {}
+
+
+def clear_backend_caches() -> None:
+    """Clear in-memory triage decision cache and endpoint cooldown state."""
+    with _CACHE_LOCK:
+        _DECISION_CACHE.clear()
+    with _RATE_LOCK:
+        _RATE_LIMIT_UNTIL.clear()
+        _AUTH_COOLDOWN_UNTIL.clear()
+
+
+def _cache_key(backend_name: str, model: str, body_bytes: bytes) -> str:
+    digest = hashlib.sha256(body_bytes).hexdigest()
+    return f"{backend_name}:{model}:{digest}"
+
+
+def _cache_get(key: str, ttl_s: float) -> DecisionBatchResult | None:
+    if ttl_s <= 0:
+        return None
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        entry = _DECISION_CACHE.get(key)
+        if entry is None:
+            return None
+        stored_at, batch = entry
+        if now - stored_at > ttl_s:
+            _DECISION_CACHE.pop(key, None)
+            return None
+        _DECISION_CACHE.move_to_end(key)
+        return replace(batch, latency_ms=0.0, input_tokens=0, output_tokens=0, cached=True)
+
+
+def _cache_put(key: str, batch: DecisionBatchResult, ttl_s: float) -> None:
+    if ttl_s <= 0 or not batch.ok:
+        return
+    with _CACHE_LOCK:
+        _DECISION_CACHE[key] = (time.monotonic(), batch)
+        _DECISION_CACHE.move_to_end(key)
+        while len(_DECISION_CACHE) > _DECISION_CACHE_MAX:
+            _DECISION_CACHE.popitem(last=False)
+
+
+def _secret_digest(secret: str) -> str:
+    if not secret:
+        return "empty"
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]
 
 
 def normalize_foundry_systemone_url(endpoint: str) -> str:
@@ -176,6 +243,18 @@ def parse_systemone_payload(
     )
 
 
+def _apply_auth_header(headers: dict[str, str], api_key: str, auth_mode: str) -> None:
+    headers.pop("Authorization", None)
+    headers.pop("api-key", None)
+    if not api_key:
+        return
+    mode = str(auth_mode or "auto").strip().lower()
+    if mode == "bearer" or (mode in ("auto", "api-key") and is_jwt_token(api_key)):
+        headers["Authorization"] = f"Bearer {api_key}"
+    else:
+        headers["api-key"] = api_key
+
+
 class SystemOneHttpBackend:
     """Client for Microsoft Foundry (`Microsoft-Decision-1.1`) and local `/v1/systemone` servers."""
 
@@ -185,12 +264,15 @@ class SystemOneHttpBackend:
         url: str,
         model: str,
         api_key: str = "",
-        auth_mode: str = "api-key",
+        auth_mode: str = "auto",
         backend_name: str = "foundry_systemone",
         timeout: float = 1.2,
         max_attempts: int = 2,
+        max_retry_wait: float = 2.0,
+        cache_ttl: float = 0.0,
         keep_alive: bool = True,
         opener_factory: Callable[..., Any] | None = None,
+        secret_refresher: Callable[[], str] | None = None,
     ) -> None:
         self.url = url
         self.model = model
@@ -199,8 +281,11 @@ class SystemOneHttpBackend:
         self.backend_name = backend_name
         self.timeout = max(0.3, float(timeout))
         self.max_attempts = max(1, int(max_attempts))
+        self.max_retry_wait = max(0.05, float(max_retry_wait))
+        self.cache_ttl = max(0.0, float(cache_ttl))
         self.keep_alive = bool(keep_alive)
         self.opener_factory = opener_factory
+        self.secret_refresher = secret_refresher
 
     def decide(
         self,
@@ -216,7 +301,16 @@ class SystemOneHttpBackend:
                 latency_ms=0.0,
                 error="Missing SystemOne endpoint URL",
             )
-        if self.backend_name == "foundry_systemone" and not self.api_key:
+
+        current_key = self.api_key
+        refreshed_once = False
+
+        if self.backend_name == "foundry_systemone" and not current_key and self.secret_refresher is not None:
+            current_key = str(self.secret_refresher() or "").strip()
+            refreshed_once = True
+            self.api_key = current_key
+
+        if self.backend_name == "foundry_systemone" and not current_key:
             return DecisionBatchResult(
                 backend=self.backend_name,
                 model=self.model,
@@ -229,7 +323,81 @@ class SystemOneHttpBackend:
         body_bytes = json.dumps(
             {"model": self.model, "state": state, "questions": wire_questions},
             ensure_ascii=False,
+            sort_keys=True,
         ).encode("utf-8")
+
+        ckey = _cache_key(self.backend_name, self.model, body_bytes)
+        cached = _cache_get(ckey, self.cache_ttl)
+        if cached is not None:
+            return cached
+
+        # Pre-flight local JWT expiry check (prevents guaranteed-401 network round-trips)
+        if current_key and is_jwt_token(current_key):
+            rem = jwt_seconds_until_expiry(current_key)
+            if rem is not None and rem <= 0:
+                if not refreshed_once and self.secret_refresher is not None:
+                    refreshed_once = True
+                    candidate = str(self.secret_refresher() or "").strip()
+                    if candidate and candidate != current_key:
+                        current_key = candidate
+                        self.api_key = current_key
+                        rem = jwt_seconds_until_expiry(current_key)
+                if rem is not None and rem <= 0:
+                    return DecisionBatchResult(
+                        backend=self.backend_name,
+                        model=self.model,
+                        answers={},
+                        latency_ms=0.0,
+                        error="HTTP 401: Foundry bearer token expired; awaiting external token refresh",
+                    )
+
+        # Check short per-(origin, credential-digest) 401 cooldown; a rotated secret changes digest and bypasses immediately
+        auth_state_key = (self.url, _secret_digest(current_key))
+        with _RATE_LOCK:
+            auth_cd = _AUTH_COOLDOWN_UNTIL.get(auth_state_key)
+            if auth_cd is not None:
+                until_mono, cached_err = auth_cd
+                if time.monotonic() < until_mono:
+                    if not refreshed_once and self.secret_refresher is not None:
+                        refreshed_once = True
+                        candidate = str(self.secret_refresher() or "").strip()
+                        if candidate and candidate != current_key:
+                            current_key = candidate
+                            self.api_key = current_key
+                            auth_state_key = (self.url, _secret_digest(current_key))
+                        else:
+                            return DecisionBatchResult(
+                                backend=self.backend_name,
+                                model=self.model,
+                                answers={},
+                                latency_ms=0.0,
+                                error=cached_err,
+                            )
+                    else:
+                        return DecisionBatchResult(
+                            backend=self.backend_name,
+                            model=self.model,
+                            answers={},
+                            latency_ms=0.0,
+                            error=cached_err,
+                        )
+                else:
+                    _AUTH_COOLDOWN_UNTIL.pop(auth_state_key, None)
+
+            rl_until = _RATE_LIMIT_UNTIL.get(self.url, 0.0)
+            rl_wait = rl_until - time.monotonic()
+
+        if rl_wait > 0:
+            if rl_wait <= self.max_retry_wait:
+                time.sleep(rl_wait)
+            else:
+                return DecisionBatchResult(
+                    backend=self.backend_name,
+                    model=self.model,
+                    answers={},
+                    latency_ms=0.0,
+                    error=f"HTTP 429: Rate limit cooldown active ({rl_wait:.1f}s remaining)",
+                )
 
         headers: dict[str, str] = {
             "Content-Type": "application/json",
@@ -237,14 +405,13 @@ class SystemOneHttpBackend:
             "Content-Length": str(len(body_bytes)),
             "User-Agent": user_agent(),
         }
-        if self.api_key:
-            if self.auth_mode == "bearer":
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            else:
-                headers["api-key"] = self.api_key
+        _apply_auth_header(headers, current_key, self.auth_mode)
 
         last_error = "unknown error"
-        for attempt in range(1, self.max_attempts + 1):
+        max_loops = self.max_attempts + 1  # allows one extra pass if secret rotates on 401
+        attempt = 0
+        while attempt < max_loops:
+            attempt += 1
             req = urllib.request.Request(
                 self.url,
                 data=body_bytes,
@@ -261,25 +428,67 @@ class SystemOneHttpBackend:
                     raw = resp.read()
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 payload = json.loads(raw.decode("utf-8"))
-                return parse_systemone_payload(
+                parsed = parse_systemone_payload(
                     payload,
                     questions,
                     backend_name=self.backend_name,
                     fallback_model=self.model,
                     latency_ms=elapsed_ms,
                 )
+                _cache_put(ckey, parsed, self.cache_ttl)
+                return parsed
             except urllib.error.HTTPError as exc:
                 err_body = ""
                 try:
                     err_body = exc.read().decode("utf-8", errors="replace")[:300]
                 except Exception:
                     pass
-                if exc.code == 429 and attempt < self.max_attempts:
-                    wait_s = parse_retry_after(exc.headers) or 0.15
-                    if wait_s <= max(0.3, self.timeout * 0.5):
+                formatted_err = f"HTTP {exc.code}: {err_body or exc.reason}"
+
+                if exc.code == 401:
+                    if not refreshed_once and self.secret_refresher is not None:
+                        refreshed_once = True
+                        candidate = str(self.secret_refresher() or "").strip()
+                        if candidate and candidate != current_key:
+                            rem_new = jwt_seconds_until_expiry(candidate)
+                            if rem_new is None or rem_new > 0:
+                                current_key = candidate
+                                self.api_key = current_key
+                                _apply_auth_header(headers, current_key, self.auth_mode)
+                                continue
+                    with _RATE_LOCK:
+                        _AUTH_COOLDOWN_UNTIL[(self.url, _secret_digest(current_key))] = (
+                            time.monotonic() + 20.0,
+                            formatted_err,
+                        )
+                    last_error = formatted_err
+                    break
+
+                if exc.code == 429:
+                    ra = parse_retry_after(exc.headers)
+                    base_wait = ra if ra is not None else (0.20 * attempt)
+                    jitter = random.uniform(0.03, 0.12) if base_wait >= 0.10 else 0.0
+                    wait_s = base_wait + jitter
+                    with _RATE_LOCK:
+                        prev_until = _RATE_LIMIT_UNTIL.get(self.url, 0.0)
+                        _RATE_LIMIT_UNTIL[self.url] = max(prev_until, time.monotonic() + base_wait)
+                    if attempt < self.max_attempts and wait_s <= self.max_retry_wait:
                         time.sleep(wait_s)
                         continue
-                last_error = f"HTTP {exc.code}: {err_body or exc.reason}"
+                    last_error = formatted_err
+                    break
+
+                if exc.code in (502, 503, 504) and attempt < self.max_attempts:
+                    time.sleep(0.08 * attempt)
+                    continue
+
+                last_error = formatted_err
+                break
+            except urllib.error.URLError as exc:
+                last_error = str(exc)
+                if attempt < self.max_attempts:
+                    time.sleep(0.05 * attempt)
+                    continue
                 break
             except Exception as exc:
                 last_error = str(exc)
@@ -592,19 +801,44 @@ class HermesAuxBackend:
         )
 
 
-def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | None = None):
-    """Instantiate the active System-1 backend from `ctx.get_config(...)`."""
-    kind = str(ctx.get_config("backend", default="foundry_systemone") or "foundry_systemone").strip()
-    timeout = float(ctx.get_config("timeout_seconds", default=1.2) or 1.2)
-    keep_alive = bool(ctx.get_config("keep_alive_enabled", default=True))
+class FallbackDecisionBackend:
+    """Wraps a primary decision backend with an opt-in supported fallback backend on error."""
 
+    def __init__(self, primary: Any, fallback: Any) -> None:
+        self.primary = primary
+        self.fallback = fallback
+
+    def decide(
+        self,
+        state: Any,
+        questions: Mapping[str, DecisionQuestion],
+    ) -> DecisionBatchResult:
+        res = self.primary.decide(state, questions)
+        if res.ok:
+            return res
+        fb_res = self.fallback.decide(state, questions)
+        if fb_res.ok:
+            return fb_res
+        return res
+
+
+def _build_single_backend(
+    ctx: Any,
+    kind: str,
+    *,
+    timeout: float,
+    keep_alive: bool,
+    max_retry_wait: float,
+    cache_ttl: float,
+    opener_factory: Callable[..., Any] | None = None,
+):
     if kind == "foundry_systemone":
         endpoint = str(ctx.get_config("foundry_endpoint", default="") or "").strip()
         deployment = str(
             ctx.get_config("foundry_deployment", default="microsoft-decision-1.1")
             or "microsoft-decision-1.1"
         ).strip()
-        auth_mode = str(ctx.get_config("foundry_auth_header", default="api-key") or "api-key").strip()
+        auth_mode = str(ctx.get_config("foundry_auth_header", default="auto") or "auto").strip()
         api_key = read_secret("TRISMEGISTUS_FOUNDRY_API_KEY")
         return SystemOneHttpBackend(
             url=normalize_foundry_systemone_url(endpoint),
@@ -613,8 +847,11 @@ def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | Non
             auth_mode=auth_mode,
             backend_name="foundry_systemone",
             timeout=timeout,
+            max_retry_wait=max_retry_wait,
+            cache_ttl=cache_ttl,
             keep_alive=keep_alive,
             opener_factory=opener_factory,
+            secret_refresher=lambda: read_secret("TRISMEGISTUS_FOUNDRY_API_KEY", refresh=True),
         )
 
     if kind == "local_systemone":
@@ -628,8 +865,11 @@ def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | Non
             auth_mode="bearer",
             backend_name="local_systemone",
             timeout=timeout,
+            max_retry_wait=max_retry_wait,
+            cache_ttl=cache_ttl,
             keep_alive=keep_alive,
             opener_factory=opener_factory,
+            secret_refresher=lambda: read_secret("TRISMEGISTUS_LOCAL_API_KEY", refresh=True),
         )
 
     if kind == "local_logits":
@@ -646,3 +886,37 @@ def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | Non
         )
 
     return HermesAuxBackend(ctx, timeout=timeout)
+
+
+def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | None = None):
+    """Instantiate the active System-1 backend (plus optional fallback) from `ctx.get_config(...)`."""
+    kind = str(ctx.get_config("backend", default="foundry_systemone") or "foundry_systemone").strip()
+    fallback_kind = str(ctx.get_config("fallback_backend", default="none") or "none").strip().lower()
+    timeout = float(ctx.get_config("timeout_seconds", default=1.2) or 1.2)
+    raw_retry_wait = ctx.get_config("max_retry_wait_seconds", default=2.0)
+    max_retry_wait = 2.0 if raw_retry_wait is None else float(raw_retry_wait)
+    raw_cache_ttl = ctx.get_config("triage_cache_ttl_seconds", default=180.0)
+    cache_ttl = 180.0 if raw_cache_ttl is None else float(raw_cache_ttl)
+    keep_alive = bool(ctx.get_config("keep_alive_enabled", default=True))
+
+    primary = _build_single_backend(
+        ctx,
+        kind,
+        timeout=timeout,
+        keep_alive=keep_alive,
+        max_retry_wait=max_retry_wait,
+        cache_ttl=cache_ttl,
+        opener_factory=opener_factory,
+    )
+    if fallback_kind not in ("", "none", kind.lower()):
+        fallback = _build_single_backend(
+            ctx,
+            fallback_kind,
+            timeout=timeout,
+            keep_alive=keep_alive,
+            max_retry_wait=max_retry_wait,
+            cache_ttl=cache_ttl,
+            opener_factory=opener_factory,
+        )
+        return FallbackDecisionBackend(primary, fallback)
+    return primary

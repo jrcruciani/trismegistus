@@ -157,6 +157,7 @@ def run_turn_triage(
             decision_latency_ms=batch.latency_ms,
             decision_input_tokens=batch.input_tokens,
             error=batch.error,
+            cached=batch.cached,
         )
 
     tier_ans = batch.answers.get("tier")
@@ -222,6 +223,7 @@ def run_turn_triage(
         decision_input_tokens=batch.input_tokens,
         trap_risk_prob=trap_risk_prob,
         trap_blocked=trap_blocked,
+        cached=batch.cached,
     )
 
 

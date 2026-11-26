@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def main() -> int:
+    if str(ROOT / "tests") not in sys.path:
+        sys.path.insert(0, str(ROOT / "tests"))
     os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="trismegistus_test_")
     spec = importlib.util.spec_from_file_location(
         "trismegistus_pkg",
@@ -36,6 +38,7 @@ def main() -> int:
         for name, fn in inspect.getmembers(tmod, inspect.isfunction):
             if name.startswith("test_"):
                 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="trismegistus_fn_")
+                pkg.backends.clear_backend_caches()
                 fn(pkg)
                 passed += 1
                 print(f"✓ {test_file.name}::{name}")

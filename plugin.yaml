@@ -1,9 +1,17 @@
-manifest_version: 2
+# Note: `manifest_version` is intentionally omitted (= v1, supported forever per Hermes docs).
+# Hermes 0.23.x `plugins validate` requires `provides_middleware` to match `ctx.register_middleware`,
+# while `plugins_manifest._KNOWN_MANIFEST_FIELDS` omits `provides_middleware` and logs a WARNING
+# only when `manifest_version >= 2`. Omitting `manifest_version` keeps `config_schema`,
+# `capabilities`, `requires_hermes`, and `provides_middleware` fully active with zero warnings.
 name: trismegistus
-version: "0.2.1"
+version: "0.2.2"
 requires_hermes: ">=0.23.0"
 author: Jorge Luis Revilla
+license: MIT
 description: "Precision & performance System-1 / System-2 cognitive router (Triage -> Modulation -> Call) powered by Microsoft-Decision-1.1 on Foundry and wire-safe across GitHub Copilot models."
+optional_env:
+  - TRISMEGISTUS_FOUNDRY_API_KEY
+  - TRISMEGISTUS_LOCAL_API_KEY
 provides_tools:
   - trismegistus_decide
   - trismegistus_escalate
@@ -32,6 +40,12 @@ config_schema:
     default: foundry_systemone
     label: "System-1 Decision Backend"
     description: "foundry_systemone (Microsoft-Decision-1.1 on Foundry /providers/microsoft/v1/systemone), local_systemone (open-jev / SystemOne API), local_logits (llama.cpp / vLLM / Ollama 1-token logprobs), or hermes_aux (Hermes auxiliary.trismegistus_decider)."
+  fallback_backend:
+    type: str
+    choices: [none, hermes_aux, local_systemone, local_logits]
+    default: none
+    label: "Optional Decision Fallback Backend"
+    description: "Optional supported fallback (e.g. hermes_aux via ctx.llm) used when the primary backend is unavailable due to missing secret, expired token (401), or sustained rate limiting (429); 'none' fails open directly to System 2."
   foundry_endpoint:
     type: str
     default: ""
@@ -44,10 +58,10 @@ config_schema:
     description: "Deployment name in Microsoft Foundry for Microsoft-Decision-1.1 (sent as the request 'model' field)."
   foundry_auth_header:
     type: str
-    choices: [api-key, bearer]
-    default: api-key
+    choices: [auto, api-key, bearer]
+    default: auto
     label: "Foundry Auth Header Mode"
-    description: "api-key sends 'api-key: <secret>'; bearer sends 'Authorization: Bearer <secret>'."
+    description: "auto detects Entra JWT access tokens ('Authorization: Bearer ***') vs static Foundry API keys ('api-key: ***'); api-key and bearer force the header explicitly."
   foundry_api_key:
     type: secret
     env: TRISMEGISTUS_FOUNDRY_API_KEY
@@ -163,6 +177,16 @@ config_schema:
     default: 1.2
     label: "Decision Timeout (seconds)"
     description: "Snappy wall-clock budget for System-1 triage calls (fail-open to System 2 on timeout)."
+  max_retry_wait_seconds:
+    type: float
+    default: 2.0
+    label: "Max Rate-Limit Retry Wait (seconds)"
+    description: "Maximum Retry-After wait honored on HTTP 429 before failing open to System 2."
+  triage_cache_ttl_seconds:
+    type: float
+    default: 180.0
+    label: "Triage Decision Cache TTL (seconds)"
+    description: "TTL for in-memory content-addressed caching of error-free System-1 verdicts across identical repeated prompts (0 disables)."
   max_excerpt_chars:
     type: int
     default: 2400
