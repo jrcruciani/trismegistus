@@ -1,10 +1,10 @@
 ---
 name: trismegistus
 description: "Use when escalating to System-2 reasoning, querying System-1 decisions, or routing subagents."
-version: "0.3.0"
+version: "0.3.1"
 ---
 
-# Trismegistus v0.3.0 — Precision & Speed Cognitive Routing
+# Trismegistus v0.3.1 — Precision & Speed Cognitive Routing
 
 Trismegistus pairs `Microsoft-Decision-1.1` on Microsoft Foundry (`0` output tokens, warm TLS Keep-Alive, multimodal + 32K context, optional same-model OpenRouter/Vercel failover) with deliberative frontier models across three stages: **Triage → Modulation → Call** (defaulting to non-mutating `shadow` mode until validated).
 

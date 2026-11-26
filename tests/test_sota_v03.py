@@ -564,3 +564,82 @@ def test_e2e_eval_harness_runs_and_preserves_full_precision_with_speedup(pkg):
     assert report["policies"]["effort_only"]["false_s1_rate"] == 0.0
     assert report["policies"]["effort_only"]["fast_path_s2_hits"] >= 4
     assert report["speedup_vs_baseline"]["effort_only_latency_reduction_pct"] > 10.0
+
+
+def test_hermes_top_level_cache_read_tokens_and_closed_loop_monotonicity_regressions(pkg):
+    """Regression tests for Hermes top-level `cache_read_tokens` and strict-threshold monotonicity."""
+    from dataclasses import dataclass as _dc
+    from test_pipeline import _StubPluginContext
+
+    # 1. Hermes delivers `cache_read_tokens` at top-level of `usage` (both dict and object forms)
+    assert pkg._extract_usage_metrics(
+        {"input_tokens": 4000, "output_tokens": 120, "cache_read_tokens": 3200, "cache_write_tokens": 200}
+    ) == (4000, 120, 3200, 200, 0)
+
+    @_dc
+    class _UsageObj:
+        input_tokens: int = 4000
+        output_tokens: int = 120
+        cache_read_tokens: int = 3200
+        cache_write_tokens: int = 0
+        reasoning_tokens: int = 48
+
+    assert pkg._extract_usage_metrics(_UsageObj()) == (4000, 120, 3200, 0, 48)
+
+    # Full hook path records Hermes's top-level `cache_read_tokens` into ledger.db
+    ctx = _StubPluginContext(
+        config={"mode": "shadow", "backend": "hermes_aux", "use_calibrated_thresholds": False, "closed_loop_enabled": False},
+        scripted_decisions=[
+            {
+                "tier": {"choice": "system1", "confidence": 0.94},
+                "effort": {"score": 0.4, "confidence": 0.90},
+                "trap_risk": {"noul": 0.05},
+                "needs_plan": {"noul": 0.05},
+            }
+        ],
+    )
+    pkg.register(ctx)
+    ctx.hooks["pre_llm_call"](session_id="ses_hcache", user_message="Translate hi to French", model="gpt-5.4")
+    ctx.hooks["post_api_request"](
+        session_id="ses_hcache",
+        api_duration=0.30,
+        usage={"input_tokens": 4000, "output_tokens": 40, "cache_read_tokens": 3200},
+    )
+    stats = pkg.ledger.read_summary_stats(limit_recent=5)
+    assert stats["cache_read_tokens"] == 3200
+    assert abs(stats["cache_hit_rate"] - 0.8) < 1e-4
+
+    # 2. Closed-loop adjustment MUST NEVER loosen already-strict thresholds (e.g. conf=0.98, trap=0.25)
+    c_both, t_both, tightened_both = pkg.calibration.compute_closed_loop_adjustment(
+        base_conf_threshold=0.98,
+        base_trap_threshold=0.25,
+        recent_s1_turns=10,
+        recent_false_s1_turns=3,
+        target_alpha=0.03,
+    )
+    assert c_both == 0.98
+    assert t_both == 0.25
+    assert tightened_both is False
+
+    # Mixed cases: tighten only the dimension that still has headroom, preserve the stricter one
+    c_mix1, t_mix1, tightened_mix1 = pkg.calibration.compute_closed_loop_adjustment(
+        base_conf_threshold=0.98,
+        base_trap_threshold=0.50,
+        recent_s1_turns=10,
+        recent_false_s1_turns=2,
+        target_alpha=0.03,
+    )
+    assert c_mix1 == 0.98
+    assert t_mix1 < 0.50 and t_mix1 >= 0.30
+    assert tightened_mix1 is True
+
+    c_mix2, t_mix2, tightened_mix2 = pkg.calibration.compute_closed_loop_adjustment(
+        base_conf_threshold=0.82,
+        base_trap_threshold=0.25,
+        recent_s1_turns=10,
+        recent_false_s1_turns=2,
+        target_alpha=0.03,
+    )
+    assert c_mix2 > 0.82 and c_mix2 <= 0.96
+    assert t_mix2 == 0.25
+    assert tightened_mix2 is True

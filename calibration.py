@@ -221,7 +221,8 @@ def calibration_store_path(base_dir: Path | None = None) -> Path:
 def save_calibration_profile(profile: CalibrationProfile, *, path: Path | None = None) -> Path:
     target = path if path is not None else calibration_store_path()
     store = read_json_safe(target)
-    profiles = store.get("profiles") if isinstance(store.get("profiles"), dict) else {}
+    raw_profiles = store.get("profiles")
+    profiles: dict[str, Any] = dict(raw_profiles) if isinstance(raw_profiles, dict) else {}
     profiles[profile.backend] = profile.to_dict()
     payload = {
         "schema_version": 1,
@@ -267,10 +268,16 @@ def compute_closed_loop_adjustment(
         return base_conf_threshold, base_trap_threshold, False
 
     excess = observed_rate - target_alpha
-    # Proportional conservative tightening: +0.02..+0.12 on confidence, -0.03..-0.18 on trap risk
+    # Proportional conservative tightening: +0.02..+0.12 on confidence, -0.03..-0.18 on trap risk.
+    # Monotonicity invariant: if caller thresholds are already stricter than [0.30, 0.96],
+    # never loosen them back toward the default ceiling/floor!
     delta_conf = min(0.12, max(0.02, excess * 0.8))
     delta_trap = min(0.18, max(0.03, excess * 1.0))
 
-    new_conf = round(min(0.96, max(base_conf_threshold, base_conf_threshold + delta_conf)), 4)
-    new_trap = round(max(0.30, min(base_trap_threshold, base_trap_threshold - delta_trap)), 4)
-    return new_conf, new_trap, True
+    conf_ceiling = min(1.0, max(0.96, base_conf_threshold))
+    trap_floor = max(0.0, min(0.30, base_trap_threshold))
+
+    new_conf = round(max(base_conf_threshold, min(conf_ceiling, base_conf_threshold + delta_conf)), 4)
+    new_trap = round(min(base_trap_threshold, max(trap_floor, base_trap_threshold - delta_trap)), 4)
+    tightened = (new_conf > base_conf_threshold) or (new_trap < base_trap_threshold)
+    return new_conf, new_trap, tightened

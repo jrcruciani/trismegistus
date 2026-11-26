@@ -645,7 +645,7 @@ def handle_slash_command(ctx: Any, raw_args: str, *, session_id: str = "") -> st
     has_foundry_key = bool(read_secret("TRISMEGISTUS_FOUNDRY_API_KEY"))
 
     lines = [
-        "Trismegistus v0.3.0 — Precision & Speed Cognitive Router",
+        "Trismegistus v0.3.1 — Precision & Speed Cognitive Router",
         f"  Mode:     {mode} (step_pacing={'on' if ctx.get_config('step_pacing_enabled', True) else 'off'}, "
         f"fast_path={'on' if ctx.get_config('fast_path_enabled', True) else 'off'}, "
         f"closed_loop={'on' if ctx.get_config('closed_loop_enabled', True) else 'off'}, "
