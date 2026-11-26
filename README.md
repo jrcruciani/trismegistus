@@ -1,4 +1,4 @@
-# Trismegistus (`v0.3.0`)
+# Trismegistus (`v0.3.1`)
 
 **Precision & speed System-1 / System-2 cognitive router for [Hermes Agent](https://github.com/NousResearch/hermes-agent)** (`Triage → Modulation → Call`).
 

@@ -125,7 +125,7 @@ def test_manifest_parses_with_zero_warnings_and_preserves_shadow_default(pkg):
         log.removeHandler(handler)
 
     assert parsed is not None
-    assert parsed.version == "0.3.0"
+    assert parsed.version == "0.3.1"
     assert parsed.config_schema["mode"]["default"] == "shadow"
     assert "llm.model_override" in parsed.capabilities
     warnings = [msg for lvl, msg in records if lvl in ("WARNING", "ERROR", "CRITICAL")]

@@ -33,7 +33,7 @@ from .triage import (
     run_turn_triage,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 _CONSTANT_SYSTEM2_PLAN_NOTE = (
     "[Trismegistus System-2 Note: High structural complexity detected. "
@@ -68,12 +68,19 @@ def _extract_usage_metrics(usage: Any) -> tuple[int, int, int, int, int]:
     out_details = _get(usage, "output_tokens_details", "completion_tokens_details")
 
     cache_read = int(
-        _get(usage, "cache_read_input_tokens", "cached_input_tokens", "cached_tokens")
+        _get(
+            usage,
+            "cache_read_tokens",
+            "cache_read_input_tokens",
+            "cached_input_tokens",
+            "cached_tokens",
+            "prompt_cache_hit_tokens",
+        )
         or (_get(in_details, "cached_tokens", "cache_read_tokens") if in_details is not None else 0)
         or 0
     )
     cache_write = int(
-        _get(usage, "cache_creation_input_tokens", "cache_write_tokens")
+        _get(usage, "cache_write_tokens", "cache_creation_input_tokens", "cache_creation_tokens")
         or (_get(in_details, "cache_creation_tokens", "cache_write_tokens") if in_details is not None else 0)
         or 0
     )
