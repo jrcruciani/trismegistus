@@ -14,7 +14,9 @@ from .copilot_lanes import (
     default_copilot_peer,
     infer_copilot_api_mode,
     normalize_copilot_model,
+    preserves_cache_on_effort_change,
 )
+from .providers_adapter import get_provider_adapter
 
 logger = logging.getLogger("plugins.trismegistus")
 
@@ -47,18 +49,31 @@ def _pace_effort_for_step(
     api_call_count: int,
     last_phase: str,
     read_streak: int,
+    max_paced_reads: int = 2,
+    last_read_chars: int = 0,
+    last_read_complex: bool = False,
+    cache_safe: bool = True,
 ) -> tuple[str, bool]:
-    """Dynamic Intra-Turn Step Pacing:
+    """Precision-first Dynamic Intra-Turn Step Pacing:
 
     - Call 1 (initial planning): full `base_effort` (`high` / `xhigh`).
-    - Intermediate calls immediately following clean read-only scout tools (`read_file`,
-      `search_files`, etc.): pace down (`xhigh` -> `medium`, `high`/`medium` -> `low`) to eliminate
-      5-12s of redundant hidden thinking per file read while keeping the exact same model and
-      100% warm KV cache.
-    - Calls following any mutation (`write_file`, `patch`), `terminal` execution, error, or
-      synthesis transition: immediately restore full `base_effort`.
+    - Early intermediate calls (`read_streak` in `1..max_paced_reads`) immediately following small,
+      clean read-only scout tools on cache-resilient families (e.g. OpenAI Responses / GPT-5+):
+      pace down (`xhigh` -> `medium`, `high`/`medium` -> `low`) to cut 5-12s of redundant hidden
+      thinking per scout call while keeping the exact same model and warm KV cache.
+    - Synthesis / dense-read protection: once `read_streak > max_paced_reads`, or the last read
+      returned a large/complex block (`>= 6000` chars or embedded error/stacktrace), restore full
+      `base_effort` BEFORE the synthesis/patch step so root-cause diagnosis is never degraded.
+    - Prompt-cache protection: when `cache_safe=False` (e.g. Claude, where effort changes alter the
+      rendered prefix and can invalidate cache breakpoints), keep `base_effort` stable for lower TTFT.
     """
+    if not cache_safe:
+        return base_effort, False
     if api_call_count <= 1 or last_phase != "scout" or read_streak < 1:
+        return base_effort, False
+    if read_streak > max(1, int(max_paced_reads)):
+        return base_effort, False
+    if last_read_complex or last_read_chars >= 6000:
         return base_effort, False
     if base_effort in ("xhigh", "max"):
         return "medium", True
@@ -86,12 +101,16 @@ def modulate_llm_request(
     mode = str(ctx.get_config("mode", default="shadow") or "shadow").strip()
     sticky_s2 = bool(ctx.get_config("sticky_system2_within_turn", default=True))
     step_pacing = bool(ctx.get_config("step_pacing_enabled", default=True))
+    max_paced_reads = max(1, int(ctx.get_config("step_pacing_max_reads", default=2) or 2))
+    protect_claude_cache = bool(ctx.get_config("step_pacing_protect_claude_cache", default=True))
     err_cap = max(1, int(ctx.get_config("escalate_after_errors", default=2) or 2))
 
     err_streak = int(ctx.state.get(f"err_streak:{session_id}", default=0) or 0) if session_id else 0
     forced_s2 = bool(ctx.state.get(f"force_s2:{session_id}", default=False)) if session_id else False
     last_phase = str(ctx.state.get(f"last_phase:{session_id}", default="turn_start") or "turn_start") if session_id else "turn_start"
     read_streak = int(ctx.state.get(f"read_streak:{session_id}", default=0) or 0) if session_id else 0
+    last_read_chars = int(ctx.state.get(f"last_read_chars:{session_id}", default=0) or 0) if session_id else 0
+    last_read_complex = bool(ctx.state.get(f"last_read_complex:{session_id}", default=False)) if session_id else False
 
     verdict.step_paced = False
 
@@ -105,6 +124,25 @@ def modulate_llm_request(
     elif sticky_s2 and api_call_count > 1 and verdict.effective_tier == "system2":
         verdict.sticky_override = True
 
+    active_provider = str(provider or "").strip().lower()
+    current_model = str(request.get("model") or model or "").strip()
+    adapter = get_provider_adapter(active_provider, api_mode)
+    if api_mode:
+        effective_wire = str(api_mode).strip()
+    else:
+        effective_wire = adapter.infer_api_mode(current_model, request)
+
+    cache_safe = (
+        True
+        if not protect_claude_cache
+        else preserves_cache_on_effort_change(
+            current_model,
+            provider=active_provider,
+            api_mode=effective_wire,
+            request=request,
+        )
+    )
+
     step_effort = verdict.effective_effort
     if step_pacing and err_streak == 0 and not forced_s2:
         step_effort, paced = _pace_effort_for_step(
@@ -112,21 +150,12 @@ def modulate_llm_request(
             api_call_count=api_call_count,
             last_phase=last_phase,
             read_streak=read_streak,
+            max_paced_reads=max_paced_reads,
+            last_read_chars=last_read_chars,
+            last_read_complex=last_read_complex,
+            cache_safe=cache_safe,
         )
         verdict.step_paced = paced
-
-    active_provider = str(provider or "").strip().lower()
-    current_model = str(request.get("model") or model or "").strip()
-    if api_mode:
-        effective_wire = str(api_mode).strip()
-    elif active_provider in ("copilot", "github-copilot", "github"):
-        effective_wire = infer_copilot_api_mode(current_model)
-    elif active_provider == "anthropic":
-        effective_wire = "anthropic_messages"
-    elif "input" in request and "messages" not in request:
-        effective_wire = "codex_responses"
-    else:
-        effective_wire = "chat_completions"
 
     cfg_s1 = str(ctx.get_config("system1_model", default="") or "").strip()
     cfg_s2 = str(ctx.get_config("system2_model", default="") or "").strip()

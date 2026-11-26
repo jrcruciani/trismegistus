@@ -144,9 +144,69 @@ def user_agent() -> str:
     try:
         from hermes_cli.version_info import hermes_user_agent
 
-        return hermes_user_agent("trismegistus/0.2.2")
+        return hermes_user_agent("trismegistus/0.3.0")
     except ImportError:
-        return "Hermes-Trismegistus/0.2.2"
+        return "Hermes-Trismegistus/0.3.0"
+
+
+def plugin_data_dir(plugin_name: str = "trismegistus") -> Path:
+    """Return the profile-scoped plugin-data directory (`<HERMES_HOME>/plugin-data/<name>`)."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        base = Path(get_hermes_home())
+    except ImportError:
+        base = Path(os.getenv("HERMES_HOME") or (Path(tempfile.gettempdir()) / "hermes-trismegistus-test"))
+    target_dir = base / "plugin-data" / plugin_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    """Atomically write JSON using Hermes's `utils.atomic_json_write` when available."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from utils import atomic_json_write
+
+        atomic_json_write(path, data)
+        return
+    except ImportError:
+        pass
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_json_safe(path: Path) -> dict[str, Any]:
+    """Read a JSON object safely via Hermes's `utils.read_json_or_empty` when available."""
+    try:
+        from utils import read_json_or_empty
+
+        loaded = read_json_or_empty(path)
+        return loaded if isinstance(loaded, dict) else {}
+    except ImportError:
+        if not path.is_file():
+            return {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+
+def hermes_clamp_effort(desired: str, supported: tuple[str, ...]) -> str | None:
+    """Bridge to Hermes's public `agent.reasoning_effort.clamp_effort` when available."""
+    if not supported:
+        return None
+    try:
+        from agent.reasoning_effort import clamp_effort as _core_clamp
+
+        res = _core_clamp(desired, supported)
+        if isinstance(res, str) and res in supported:
+            return res
+    except Exception:
+        pass
+    return None
 
 
 class _BytesHttpResponse:
@@ -388,9 +448,7 @@ def open_plugin_db(plugin_name: str = "trismegistus", filename: str = "ledger.db
 
         return plugin_db(plugin_name, filename)
     except ImportError:
-        base = Path(os.getenv("HERMES_HOME") or (Path(tempfile.gettempdir()) / "hermes-trismegistus-test"))
-        target_dir = base / "plugin-data" / plugin_name
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir = plugin_data_dir(plugin_name)
         conn = sqlite3.connect(str(target_dir / filename), check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         return conn

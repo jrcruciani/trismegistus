@@ -4,13 +4,14 @@
 # only when `manifest_version >= 2`. Omitting `manifest_version` keeps `config_schema`,
 # `capabilities`, `requires_hermes`, and `provides_middleware` fully active with zero warnings.
 name: trismegistus
-version: "0.2.2"
+version: "0.3.0"
 requires_hermes: ">=0.23.0"
 author: Jorge Luis Revilla
 license: MIT
-description: "Precision & performance System-1 / System-2 cognitive router (Triage -> Modulation -> Call) powered by Microsoft-Decision-1.1 on Foundry and wire-safe across GitHub Copilot models."
+description: "Precision & speed System-1 / System-2 cognitive router (Triage -> Modulation -> Call) with Microsoft-Decision-1.1, conformal calibration, closed-loop precision guard, multimodal & KV-cache awareness."
 optional_env:
   - TRISMEGISTUS_FOUNDRY_API_KEY
+  - TRISMEGISTUS_SECONDARY_API_KEY
   - TRISMEGISTUS_LOCAL_API_KEY
 provides_tools:
   - trismegistus_decide
@@ -67,6 +68,21 @@ config_schema:
     env: TRISMEGISTUS_FOUNDRY_API_KEY
     label: "Foundry API Key / Token"
     description: "API key or bearer token for Microsoft Foundry (stored in profile .env, never in config.yaml)."
+  secondary_systemone_endpoint:
+    type: str
+    default: ""
+    label: "Secondary Same-Model Decision Endpoint (Failover)"
+    description: "Optional same-model Microsoft-Decision-1.1 failover endpoint ('openrouter', 'vercel', or an explicit Foundry/SystemOne URL) used immediately on primary 429/401/timeout without changing calibration."
+  secondary_systemone_model:
+    type: str
+    default: ""
+    label: "Secondary Decision Model ID"
+    description: "Optional model identifier for the secondary same-model endpoint (auto-defaults for openrouter/vercel/foundry when empty)."
+  secondary_api_key:
+    type: secret
+    env: TRISMEGISTUS_SECONDARY_API_KEY
+    label: "Secondary Decision Endpoint API Key"
+    description: "Optional API key for the secondary Microsoft-Decision-1.1 failover endpoint (stored in profile .env)."
   local_endpoint:
     type: str
     default: "http://127.0.0.1:8080/v1"
@@ -96,7 +112,42 @@ config_schema:
     type: bool
     default: true
     label: "Dynamic Intra-Turn Step Pacing"
-    description: "In effort_only mode, pace intermediate read-only exploration steps to low/medium effort for speed, restoring full high/xhigh effort on edits, terminal runs, errors, or synthesis."
+    description: "In effort_only mode, pace early read-only exploration steps to low/medium effort on cache-resilient models, automatically restoring full effort before synthesis, dense reads, mutations, or errors."
+  step_pacing_max_reads:
+    type: int
+    default: 2
+    label: "Max Consecutive Paced Read Steps"
+    description: "Maximum consecutive read-only scout steps paced down before restoring full base effort for diagnosis and synthesis."
+  step_pacing_protect_claude_cache:
+    type: bool
+    default: true
+    label: "Protect Claude Prompt Cache on Step Pacing"
+    description: "Keep reasoning effort steady mid-turn on Claude models so thinking/effort prefix rendering never invalidates prompt cache breakpoints."
+  fast_path_enabled:
+    type: bool
+    default: true
+    label: "Sub-Millisecond S2 Structural Fast-Path"
+    description: "Bypass triage network RTT in active modes for unmistakable deep-engineering inputs (multi-hunk diffs, stacktraces, large multi-file code, forced escalations). Never fast-paths down to System 1."
+  multimodal_triage_enabled:
+    type: bool
+    default: true
+    label: "Multimodal Triage Support"
+    description: "Forward bounded image attachments to multimodal Decision-1.1 backends and veto blind System-1 downgrades on text-only backends."
+  use_calibrated_thresholds:
+    type: bool
+    default: true
+    label: "Use Backend Conformal Calibration Profile"
+    description: "Automatically load backend-specific conformal thresholds from <HERMES_HOME>/plugin-data/trismegistus/calibration.json when present."
+  closed_loop_enabled:
+    type: bool
+    default: true
+    label: "Closed-Loop Precision Hardening"
+    description: "Monitor implicit false-S1 signals (error streaks, mid-turn escalations, verify failures) and conservatively tighten thresholds under distribution shift."
+  closed_loop_target_alpha:
+    type: float
+    default: 0.03
+    label: "Closed-Loop Max False-S1 Budget (Alpha)"
+    description: "Maximum tolerated observed false-S1 rate over the recent ledger window before conservative threshold hardening activates."
   system1_model:
     type: str
     default: ""
@@ -189,6 +240,6 @@ config_schema:
     description: "TTL for in-memory content-addressed caching of error-free System-1 verdicts across identical repeated prompts (0 disables)."
   max_excerpt_chars:
     type: int
-    default: 2400
+    default: 4000
     label: "Max Redacted Excerpt Characters"
-    description: "Maximum redacted prompt characters included in System-1 triage state."
+    description: "Maximum redacted head+tail prompt characters included in System-1 triage state (60% head + 40% tail)."

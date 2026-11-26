@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 import hashlib
 import json
@@ -117,6 +118,27 @@ def normalize_local_systemone_url(endpoint: str) -> str:
     if raw.endswith("/v1"):
         return f"{raw}/systemone"
     return f"{raw}/v1/systemone"
+
+
+def normalize_secondary_systemone_url(endpoint: str) -> str:
+    """Normalize a secondary Microsoft-Decision-1.1 endpoint (Foundry, OpenRouter, Vercel, or custom)."""
+    raw = str(endpoint or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    low = raw.lower()
+    if low == "openrouter":
+        return "https://openrouter.ai/api/v1/decisions"
+    if low == "vercel":
+        return "https://ai-gateway.vercel.sh/v1/decisions"
+    if "services.ai.azure.com" in low or "cognitiveservices.azure.com" in low:
+        return normalize_foundry_systemone_url(raw)
+    if low.endswith(("/systemone", "/decisions")):
+        return raw
+    if "openrouter.ai" in low:
+        return f"{raw}/decisions" if low.endswith("/v1") else f"{raw}/api/v1/decisions"
+    if "vercel" in low:
+        return f"{raw}/decisions" if low.endswith("/v1") else f"{raw}/v1/decisions"
+    return normalize_local_systemone_url(raw)
 
 
 def normalize_chat_completions_url(endpoint: str) -> str:
@@ -257,6 +279,8 @@ def _apply_auth_header(headers: dict[str, str], api_key: str, auth_mode: str) ->
 
 class SystemOneHttpBackend:
     """Client for Microsoft Foundry (`Microsoft-Decision-1.1`) and local `/v1/systemone` servers."""
+
+    supports_multimodal: bool = True
 
     def __init__(
         self,
@@ -527,6 +551,8 @@ def _softmax_from_logprobs(top_logprobs: list[dict[str, Any]], label_map: dict[s
 class LocalLogitsBackend:
     """Calibrated single-token logprobs client for local `llama-server`, `vLLM`, or `Ollama`."""
 
+    supports_multimodal: bool = False
+
     def __init__(
         self,
         *,
@@ -544,7 +570,14 @@ class LocalLogitsBackend:
         self.keep_alive = bool(keep_alive)
         self.opener_factory = opener_factory
 
-    def _ask_one(self, state_json: str, q: DecisionQuestion) -> tuple[DecisionAnswer | None, int, str | None]:
+    def _ask_one(
+        self,
+        state_json: str,
+        q: DecisionQuestion,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[DecisionAnswer | None, int, str | None]:
+        req_timeout = max(0.15, float(self.timeout if timeout is None else timeout))
         label_map: dict[str, str] = {}
         prompt_lines = [
             "You are a calibrated System-1 decision head. Reply with ONLY the single letter token of the best answer.",
@@ -599,7 +632,7 @@ class LocalLogitsBackend:
         try:
             with open_safe_url(
                 req,
-                timeout=self.timeout,
+                timeout=req_timeout,
                 opener_factory=self.opener_factory,
                 keep_alive=self.keep_alive,
             ) as resp:
@@ -670,17 +703,48 @@ class LocalLogitsBackend:
         questions: Mapping[str, DecisionQuestion],
     ) -> DecisionBatchResult:
         started = time.perf_counter()
+        deadline = started + self.timeout
         state_json = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
         answers: dict[str, DecisionAnswer] = {}
         total_in = 0
         last_err: str | None = None
-        for q_name, q_spec in questions.items():
-            ans, in_tok, err = self._ask_one(state_json, q_spec)
-            total_in += in_tok
-            if ans is not None:
-                answers[q_name] = ans
-            elif err:
-                last_err = err
+
+        items = list(questions.items())
+        if len(items) <= 1:
+            for q_name, q_spec in items:
+                rem = max(0.15, deadline - time.perf_counter())
+                ans, in_tok, err = self._ask_one(state_json, q_spec, timeout=rem)
+                total_in += in_tok
+                if ans is not None:
+                    answers[q_name] = ans
+                elif err:
+                    last_err = err
+        else:
+            # Run independent single-token logprob questions concurrently under one wall-clock deadline.
+            with ThreadPoolExecutor(max_workers=min(4, len(items))) as pool:
+                future_map = {}
+                for q_name, q_spec in items:
+                    rem = max(0.15, deadline - time.perf_counter())
+                    fut = pool.submit(self._ask_one, state_json, q_spec, timeout=rem)
+                    future_map[fut] = q_name
+                wait_budget = max(0.05, deadline - time.perf_counter())
+                try:
+                    for fut in as_completed(future_map, timeout=wait_budget):
+                        q_name = future_map[fut]
+                        try:
+                            ans, in_tok, err = fut.result()
+                        except Exception as exc:
+                            ans, in_tok, err = None, 0, str(exc)
+                        total_in += in_tok
+                        if ans is not None:
+                            answers[q_name] = ans
+                        elif err:
+                            last_err = err
+                except TimeoutError:
+                    last_err = f"local_logits global deadline ({self.timeout:.2f}s) exceeded"
+                    for fut in future_map:
+                        fut.cancel()
+
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         return DecisionBatchResult(
             backend="local_logits",
@@ -695,6 +759,8 @@ class LocalLogitsBackend:
 
 class HermesAuxBackend:
     """Zero-config fallback using `ctx.llm.complete_structured` on `trismegistus_decider`."""
+
+    supports_multimodal: bool = False
 
     def __init__(self, ctx: Any, *, timeout: float = 2.0) -> None:
         self.ctx = ctx
@@ -802,11 +868,16 @@ class HermesAuxBackend:
 
 
 class FallbackDecisionBackend:
-    """Wraps a primary decision backend with an opt-in supported fallback backend on error."""
+    """Wraps a primary decision backend with a same-model failover or opt-in fallback backend."""
 
-    def __init__(self, primary: Any, fallback: Any) -> None:
+    def __init__(self, primary: Any, fallback: Any, *, preserve_calibration: bool = False) -> None:
         self.primary = primary
         self.fallback = fallback
+        self.preserve_calibration = preserve_calibration
+
+    @property
+    def supports_multimodal(self) -> bool:
+        return bool(getattr(self.primary, "supports_multimodal", False))
 
     def decide(
         self,
@@ -818,8 +889,49 @@ class FallbackDecisionBackend:
             return res
         fb_res = self.fallback.decide(state, questions)
         if fb_res.ok:
-            return fb_res
+            return replace(fb_res, failover_used=True)
         return res
+
+
+def _build_secondary_systemone_backend(
+    ctx: Any,
+    *,
+    timeout: float,
+    keep_alive: bool,
+    max_retry_wait: float,
+    cache_ttl: float,
+    opener_factory: Callable[..., Any] | None = None,
+) -> SystemOneHttpBackend | None:
+    """Build optional same-model Microsoft-Decision-1.1 failover endpoint (OpenRouter/Vercel/Foundry)."""
+    sec_ep = str(ctx.get_config("secondary_systemone_endpoint", default="") or "").strip()
+    if not sec_ep:
+        return None
+    url = normalize_secondary_systemone_url(sec_ep)
+    if not url:
+        return None
+    low = sec_ep.lower()
+    default_model = (
+        "microsoft/microsoft-decision-1.1"
+        if ("openrouter" in low)
+        else ("microsoft/decision-1.1" if "vercel" in low else "microsoft-decision-1.1")
+    )
+    model = str(ctx.get_config("secondary_systemone_model", default="") or default_model).strip()
+    api_key = read_secret("TRISMEGISTUS_SECONDARY_API_KEY")
+    auth_mode = "auto" if ("azure.com" in url.lower()) else "bearer"
+    return SystemOneHttpBackend(
+        url=url,
+        model=model,
+        api_key=api_key,
+        auth_mode=auth_mode,
+        backend_name="secondary_systemone",
+        timeout=timeout,
+        max_attempts=1,
+        max_retry_wait=min(0.5, max_retry_wait),
+        cache_ttl=cache_ttl,
+        keep_alive=keep_alive,
+        opener_factory=opener_factory,
+        secret_refresher=lambda: read_secret("TRISMEGISTUS_SECONDARY_API_KEY", refresh=True),
+    )
 
 
 def _build_single_backend(
@@ -908,6 +1020,22 @@ def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | Non
         cache_ttl=cache_ttl,
         opener_factory=opener_factory,
     )
+    # 1. Prefer same-model failover (e.g. Foundry -> OpenRouter/Vercel Microsoft-Decision-1.1)
+    #    so 429/401 bursts recover in ~100ms without changing probability calibration.
+    chain: Any = primary
+    if kind.lower() == "foundry_systemone":
+        secondary = _build_secondary_systemone_backend(
+            ctx,
+            timeout=timeout,
+            keep_alive=keep_alive,
+            max_retry_wait=max_retry_wait,
+            cache_ttl=cache_ttl,
+            opener_factory=opener_factory,
+        )
+        if secondary is not None:
+            chain = FallbackDecisionBackend(chain, secondary, preserve_calibration=True)
+
+    # 2. Opt-in cross-backend fallback (e.g. hermes_aux / local_logits)
     if fallback_kind not in ("", "none", kind.lower()):
         fallback = _build_single_backend(
             ctx,
@@ -918,5 +1046,5 @@ def build_decision_backend(ctx: Any, *, opener_factory: Callable[..., Any] | Non
             cache_ttl=cache_ttl,
             opener_factory=opener_factory,
         )
-        return FallbackDecisionBackend(primary, fallback)
-    return primary
+        chain = FallbackDecisionBackend(chain, fallback, preserve_calibration=False)
+    return chain

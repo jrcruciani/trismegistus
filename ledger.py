@@ -10,6 +10,7 @@ import threading
 import time
 from typing import Any
 
+from .calibration import load_calibration_profile
 from .compat import open_plugin_db, read_secret, redact_text
 from .contracts import TriageVerdict
 
@@ -44,6 +45,12 @@ CREATE TABLE IF NOT EXISTS trismegistus_decisions (
     provider_duration_ms REAL DEFAULT 0,
     provider_input_tokens INTEGER DEFAULT 0,
     provider_output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    fast_pathed INTEGER DEFAULT 0,
+    turn_outcome TEXT DEFAULT 'clean',
+    calibration_source TEXT DEFAULT 'config',
     error TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_trismegistus_ts ON trismegistus_decisions(ts DESC);
@@ -55,6 +62,12 @@ _MIGRATIONS = (
     "ALTER TABLE trismegistus_decisions ADD COLUMN step_paced INTEGER DEFAULT 0",
     "ALTER TABLE trismegistus_decisions ADD COLUMN turn_id TEXT DEFAULT ''",
     "ALTER TABLE trismegistus_decisions ADD COLUMN step_index INTEGER DEFAULT 1",
+    "ALTER TABLE trismegistus_decisions ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE trismegistus_decisions ADD COLUMN cache_write_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE trismegistus_decisions ADD COLUMN reasoning_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE trismegistus_decisions ADD COLUMN fast_pathed INTEGER DEFAULT 0",
+    "ALTER TABLE trismegistus_decisions ADD COLUMN turn_outcome TEXT DEFAULT 'clean'",
+    "ALTER TABLE trismegistus_decisions ADD COLUMN calibration_source TEXT DEFAULT 'config'",
 )
 
 _db_lock = threading.Lock()
@@ -109,6 +122,9 @@ def record_turn_completion(
     provider_duration_ms: float = 0.0,
     provider_input_tokens: int = 0,
     provider_output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    reasoning_tokens: int = 0,
 ) -> None:
     """Persist one completed API step while attributing triage tokens/errors strictly once per turn."""
     verdict.recorded_steps += 1
@@ -132,8 +148,10 @@ def record_turn_completion(
                     wire_guarded, trap_risk_prob, trap_blocked, step_paced,
                     decision_latency_ms, decision_input_tokens,
                     applied_model, applied_effort, provider_duration_ms,
-                    provider_input_tokens, provider_output_tokens, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provider_input_tokens, provider_output_tokens,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    fast_pathed, turn_outcome, calibration_source, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     time.time(),
@@ -162,6 +180,12 @@ def record_turn_completion(
                     float(provider_duration_ms),
                     int(provider_input_tokens),
                     int(provider_output_tokens),
+                    int(cache_read_tokens),
+                    int(cache_write_tokens),
+                    int(reasoning_tokens),
+                    int(verdict.fast_pathed),
+                    str(verdict.turn_outcome or "clean"),
+                    str(verdict.calibration_source or "config"),
                     step_error,
                 ),
             )
@@ -170,12 +194,74 @@ def record_turn_completion(
             conn.close()
 
 
-def _deduplicate_turns_from_rows(rows: list[tuple[Any, ...]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+def record_turn_outcome(turn_id: str, outcome: str) -> None:
+    """Update the closed-loop outcome tag for a recorded turn (e.g., `false_s1_escalated`)."""
+    tid = str(turn_id or "").strip()
+    if not tid:
+        return
+    with _db_lock:
+        conn = open_plugin_db("trismegistus", "ledger.db")
+        try:
+            _ensure_schema(conn)
+            conn.execute(
+                "UPDATE trismegistus_decisions SET turn_outcome = ? WHERE turn_id = ?",
+                (str(outcome or "clean"), tid),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def recent_closed_loop_window(backend: str, *, limit: int = 50) -> tuple[int, int]:
+    """Return `(recent_s1_turns, recent_false_s1_turns)` for `backend` from the local SQLite ledger."""
+    with _db_lock:
+        conn = open_plugin_db("trismegistus", "ledger.db")
+        try:
+            _ensure_schema(conn)
+            cur = conn.execute(
+                """
+                SELECT turn_id, effective_tier, turn_outcome
+                FROM trismegistus_decisions
+                WHERE backend = ? AND step_index = 1 AND error = '' AND fast_pathed = 0
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (str(backend or ""), max(1, int(limit))),
+            )
+            rows = cur.fetchall()
+        except sqlite3.OperationalError:
+            return 0, 0
+        finally:
+            conn.close()
+
+    s1_turns = 0
+    false_s1 = 0
+    for _tid, eff_tier, outcome in rows:
+        out_str = str(outcome or "clean")
+        if eff_tier == "system1" or out_str.startswith("false_s1_"):
+            s1_turns += 1
+            if out_str.startswith("false_s1_"):
+                false_s1 += 1
+    return s1_turns, false_s1
+
+
+def _deduplicate_turns_from_rows(rows: list[tuple[Any, ...]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Collapse multi-step tool-loop rows (both legacy pre-v0.2.2 and `step_index`-tagged) into unique turns."""
     unique_turns: list[dict[str, Any]] = []
     seen_turn_ids: dict[str, int] = {}
     last_legacy_by_session: dict[str, tuple[tuple[Any, ...], float, int]] = {}
-    step_flags = {"total_steps": len(rows), "step_paced": 0, "wire_guarded": 0}
+    step_flags: dict[str, Any] = {
+        "total_steps": len(rows),
+        "step_paced": 0,
+        "wire_guarded": 0,
+        "provider_duration_ms_sum": 0.0,
+        "provider_duration_count": 0,
+        "provider_input_tokens": 0,
+        "provider_output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+    }
     step_error_counts: Counter[str] = Counter()
 
     for r in rows:
@@ -202,17 +288,39 @@ def _deduplicate_turns_from_rows(rows: list[tuple[Any, ...]]) -> tuple[list[dict
             in_tok,
             amodel,
             aeffort,
+            p_dur,
+            p_in,
+            p_out,
+            c_read,
+            c_write,
+            r_tok,
+            fast_p,
+            outcome,
+            cal_src,
             err,
         ) = r
         step_flags["step_paced"] += int(bool(paced))
         step_flags["wire_guarded"] += int(bool(wguard))
+        if float(p_dur or 0.0) > 0:
+            step_flags["provider_duration_ms_sum"] += float(p_dur)
+            step_flags["provider_duration_count"] += 1
+        step_flags["provider_input_tokens"] += int(p_in or 0)
+        step_flags["provider_output_tokens"] += int(p_out or 0)
+        step_flags["cache_read_tokens"] += int(c_read or 0)
+        step_flags["cache_write_tokens"] += int(c_write or 0)
+        step_flags["reasoning_tokens"] += int(r_tok or 0)
         step_error_counts[classify_error_category(err)] += 1
 
         tid = str(turn_id or "").strip()
         s_idx = int(step_idx or 1)
         if tid:
             if tid in seen_turn_ids:
-                unique_turns[seen_turn_ids[tid]]["steps"] += 1
+                t_entry = unique_turns[seen_turn_ids[tid]]
+                t_entry["steps"] += 1
+                t_entry["step_paced"] = t_entry["step_paced"] or bool(paced)
+                t_entry["wire_guarded"] = t_entry["wire_guarded"] or bool(wguard)
+                if outcome and str(outcome) != "clean":
+                    t_entry["turn_outcome"] = str(outcome)
                 continue
             if s_idx > 1:
                 continue
@@ -235,6 +343,11 @@ def _deduplicate_turns_from_rows(rows: list[tuple[Any, ...]]) -> tuple[list[dict
                     "abstained": bool(abst),
                     "trap_risk_prob": float(trap_p or 0.0),
                     "trap_blocked": bool(trap_b),
+                    "step_paced": bool(paced),
+                    "wire_guarded": bool(wguard),
+                    "fast_pathed": bool(fast_p),
+                    "turn_outcome": str(outcome or "clean"),
+                    "calibration_source": str(cal_src or "config"),
                     "decision_latency_ms": float(lat_ms or 0.0),
                     "decision_input_tokens": int(in_tok or 0),
                     "applied_model": str(amodel or ""),
@@ -245,9 +358,7 @@ def _deduplicate_turns_from_rows(rows: list[tuple[Any, ...]]) -> tuple[list[dict
             )
             continue
 
-        # Legacy pre-v0.2.2 row without `turn_id`: within a multi-step tool loop, `pre_llm_call`
-        # stamped one TriageVerdict whose `(lat_ms, in_tok, conf, trap_p, escore, rtier, err)` was
-        # written verbatim on every `post_api_request` step of that session.
+        # Legacy pre-v0.2.2 row without `turn_id`
         sig = (
             round(float(lat_ms or 0.0), 5),
             int(in_tok or 0),
@@ -261,7 +372,10 @@ def _deduplicate_turns_from_rows(rows: list[tuple[Any, ...]]) -> tuple[list[dict
         prev = last_legacy_by_session.get(sess_key)
         if prev is not None and prev[0] == sig and (float(ts or 0.0) - prev[1]) < 1800.0:
             t_pos = prev[2]
-            unique_turns[t_pos]["steps"] += 1
+            t_entry = unique_turns[t_pos]
+            t_entry["steps"] += 1
+            t_entry["step_paced"] = t_entry["step_paced"] or bool(paced)
+            t_entry["wire_guarded"] = t_entry["wire_guarded"] or bool(wguard)
             last_legacy_by_session[sess_key] = (sig, float(ts or 0.0), t_pos)
             continue
 
@@ -285,6 +399,11 @@ def _deduplicate_turns_from_rows(rows: list[tuple[Any, ...]]) -> tuple[list[dict
                 "abstained": bool(abst),
                 "trap_risk_prob": float(trap_p or 0.0),
                 "trap_blocked": bool(trap_b),
+                "step_paced": bool(paced),
+                "wire_guarded": bool(wguard),
+                "fast_pathed": bool(fast_p),
+                "turn_outcome": str(outcome or "clean"),
+                "calibration_source": str(cal_src or "config"),
                 "decision_latency_ms": float(lat_ms or 0.0),
                 "decision_input_tokens": int(in_tok or 0),
                 "applied_model": str(amodel or ""),
@@ -337,9 +456,17 @@ def audit_ledger_db(db_path: str | Path | None = None, *, limit_recent: int = 5)
                 "trap_blocked": 0,
                 "step_paced": 0,
                 "wire_guarded": 0,
+                "fast_pathed": 0,
+                "outcomes_by_type": {},
+                "false_s1_signals": 0,
                 "avg_triage_ms": 0.0,
                 "p50_triage_ms": 0.0,
                 "p95_triage_ms": 0.0,
+                "avg_provider_duration_ms": 0.0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "cache_hit_rate": 0.0,
                 "avg_confidence": 0.0,
                 "decision_input_tokens": 0,
                 "estimated_cost_usd": 0.0,
@@ -350,13 +477,24 @@ def audit_ledger_db(db_path: str | Path | None = None, *, limit_recent: int = 5)
         trap_p_expr = "trap_risk_prob" if "trap_risk_prob" in cols else "0.0"
         trap_b_expr = "trap_blocked" if "trap_blocked" in cols else "0"
         paced_expr = "step_paced" if "step_paced" in cols else "0"
+        pdur_expr = "provider_duration_ms" if "provider_duration_ms" in cols else "0.0"
+        pin_expr = "provider_input_tokens" if "provider_input_tokens" in cols else "0"
+        pout_expr = "provider_output_tokens" if "provider_output_tokens" in cols else "0"
+        cread_expr = "cache_read_tokens" if "cache_read_tokens" in cols else "0"
+        cwrite_expr = "cache_write_tokens" if "cache_write_tokens" in cols else "0"
+        rtok_expr = "reasoning_tokens" if "reasoning_tokens" in cols else "0"
+        fast_expr = "fast_pathed" if "fast_pathed" in cols else "0"
+        out_expr = "turn_outcome" if "turn_outcome" in cols else "'clean'"
+        cal_expr = "calibration_source" if "calibration_source" in cols else "'config'"
 
         cur = conn.execute(
             f"""
             SELECT id, ts, session_id, {turn_expr}, {step_expr}, mode, backend, decision_model,
                    raw_tier, effective_tier, effort_score, effective_effort, confidence,
                    abstained, {trap_p_expr}, {trap_b_expr}, {paced_expr}, wire_guarded,
-                   decision_latency_ms, decision_input_tokens, applied_model, applied_effort, error
+                   decision_latency_ms, decision_input_tokens, applied_model, applied_effort,
+                   {pdur_expr}, {pin_expr}, {pout_expr}, {cread_expr}, {cwrite_expr}, {rtok_expr},
+                   {fast_expr}, {out_expr}, {cal_expr}, error
             FROM trismegistus_decisions
             ORDER BY id ASC
             """
@@ -368,6 +506,7 @@ def audit_ledger_db(db_path: str | Path | None = None, *, limit_recent: int = 5)
     turns, step_flags = _deduplicate_turns_from_rows(all_rows)
     total_turns = len(turns)
     turn_err_counts = Counter(t["error_category"] for t in turns)
+    outcome_counts = Counter(t["turn_outcome"] for t in turns)
     ok_turns = [t for t in turns if t["error_category"] == "ok"]
     ok_lats = sorted(t["decision_latency_ms"] for t in ok_turns if t["decision_latency_ms"] > 0)
     all_lats = sorted(t["decision_latency_ms"] for t in turns if t["decision_latency_ms"] >= 0)
@@ -376,9 +515,23 @@ def audit_ledger_db(db_path: str | Path | None = None, *, limit_recent: int = 5)
     s2_count = sum(1 for t in turns if t["effective_tier"] == "system2")
     abst_count = sum(1 for t in turns if t["abstained"])
     trap_count = sum(1 for t in turns if t["trap_blocked"])
+    fast_count = sum(1 for t in turns if t["fast_pathed"])
+    false_s1_signals = sum(v for k, v in outcome_counts.items() if str(k).startswith("false_s1_"))
     in_tokens = sum(t["decision_input_tokens"] for t in turns)
     avg_ms = (sum(ok_lats) / len(ok_lats)) if ok_lats else ((sum(all_lats) / len(all_lats)) if all_lats else 0.0)
     avg_conf = (sum(t["confidence"] for t in ok_turns) / len(ok_turns)) if ok_turns else 0.0
+
+    p_in_total = int(step_flags["provider_input_tokens"])
+    c_read_total = int(step_flags["cache_read_tokens"])
+    c_write_total = int(step_flags["cache_write_tokens"])
+    r_tok_total = int(step_flags["reasoning_tokens"])
+    cache_denom = max(p_in_total, c_read_total)
+    cache_hit_rate = round(c_read_total / cache_denom, 4) if cache_denom > 0 else 0.0
+    avg_prov_ms = (
+        round(step_flags["provider_duration_ms_sum"] / step_flags["provider_duration_count"], 2)
+        if step_flags["provider_duration_count"] > 0
+        else 0.0
+    )
 
     recent_turns = list(reversed(turns[-max(1, int(limit_recent)) :])) if turns else []
     recent = [
@@ -392,8 +545,10 @@ def audit_ledger_db(db_path: str | Path | None = None, *, limit_recent: int = 5)
             "model": t["applied_model"],
             "abstained": t["abstained"],
             "trap_blocked": t["trap_blocked"],
-            "step_paced": False,
-            "wire_guarded": False,
+            "step_paced": t["step_paced"],
+            "wire_guarded": t["wire_guarded"],
+            "fast_pathed": t["fast_pathed"],
+            "turn_outcome": t["turn_outcome"],
             "steps": t["steps"],
             "error": redact_text(t["error"][:120]) if t["error"] else "",
         }
@@ -424,9 +579,17 @@ def audit_ledger_db(db_path: str | Path | None = None, *, limit_recent: int = 5)
         "trap_blocked": trap_count,
         "step_paced": step_flags["step_paced"],
         "wire_guarded": step_flags["wire_guarded"],
+        "fast_pathed": fast_count,
+        "outcomes_by_type": dict(outcome_counts),
+        "false_s1_signals": false_s1_signals,
         "avg_triage_ms": round(avg_ms, 2),
         "p50_triage_ms": round(_percentile(ok_lats or all_lats, 50.0), 2),
         "p95_triage_ms": round(_percentile(ok_lats or all_lats, 95.0), 2),
+        "avg_provider_duration_ms": avg_prov_ms,
+        "cache_read_tokens": c_read_total,
+        "cache_write_tokens": c_write_total,
+        "reasoning_tokens": r_tok_total,
+        "cache_hit_rate": cache_hit_rate,
         "avg_confidence": round(avg_conf, 4),
         "decision_input_tokens": in_tokens,
         "estimated_cost_usd": round((in_tokens / 1_000_000.0) * FOUNDRY_PRICE_PER_1M_INPUT_USD, 6),
@@ -440,7 +603,7 @@ def read_summary_stats(limit_recent: int = 5) -> dict[str, Any]:
 
 
 def handle_slash_command(ctx: Any, raw_args: str, *, session_id: str = "") -> str:
-    """Handler for `/trismegistus [status|stats|last|mode <shadow|effort_only|tier_and_effort>|escalate]`."""
+    """Handler for `/trismegistus [status|stats|last|outcomes|calibrate|mode <...>|escalate]`."""
     tokens = (raw_args or "").strip().split()
     sub = tokens[0].lower() if tokens else "status"
 
@@ -457,40 +620,78 @@ def handle_slash_command(ctx: Any, raw_args: str, *, session_id: str = "") -> st
         ctx.state.set(f"force_s2:{session_id}", True)
         return "Next turn in this session armed for System-2 (xhigh effort)."
 
+    backend = str(ctx.get_config("backend", default="foundry_systemone") or "foundry_systemone")
+    if sub == "calibrate":
+        profile = load_calibration_profile(backend)
+        if profile is None:
+            return (
+                f"No conformal calibration profile saved for backend '{backend}'.\n"
+                "Run `python3 benchmarks/run_heldout.py --backend <backend> --calibrate` to generate one."
+            )
+        return (
+            f"Trismegistus Conformal Calibration Profile ({profile.backend}):\n"
+            f"  confidence_threshold: {profile.confidence_threshold:.4f}\n"
+            f"  trap_risk_threshold:  {profile.trap_risk_threshold:.4f}\n"
+            f"  target_alpha:         {profile.target_alpha:.4f} | empirical_ffr: {profile.empirical_false_fast_route_rate:.4f} "
+            f"(conformal bound: {profile.conformal_risk_bound:.4f}, Wilson95 upper: {profile.wilson95_false_fast_route_upper:.4f})\n"
+            f"  achieved_s1_recall:   {profile.achieved_s1_recall:.4f} (n={profile.n_total}, must_s2={profile.n_must_s2})"
+        )
+
     stats = read_summary_stats(limit_recent=5)
     mode = ctx.get_config("mode", default="shadow")
-    backend = ctx.get_config("backend", default="foundry_systemone")
     fallback = ctx.get_config("fallback_backend", default="none")
+    secondary_ep = ctx.get_config("secondary_systemone_endpoint", default="")
     endpoint = ctx.get_config("foundry_endpoint", default="") or ctx.get_config("local_endpoint", default="")
     has_foundry_key = bool(read_secret("TRISMEGISTUS_FOUNDRY_API_KEY"))
 
     lines = [
-        "Trismegistus v0.2.2 — Precision & Performance Cognitive Router",
-        f"  Mode:     {mode} (step_pacing={'on' if ctx.get_config('step_pacing_enabled', True) else 'off'}, verify_gate={'on' if ctx.get_config('verify_gate_enabled', True) else 'off'})",
-        f"  Backend:  {backend} ({endpoint or 'not set'}) | fallback={fallback} | keep_alive={'on' if ctx.get_config('keep_alive_enabled', True) else 'off'}",
+        "Trismegistus v0.3.0 — Precision & Speed Cognitive Router",
+        f"  Mode:     {mode} (step_pacing={'on' if ctx.get_config('step_pacing_enabled', True) else 'off'}, "
+        f"fast_path={'on' if ctx.get_config('fast_path_enabled', True) else 'off'}, "
+        f"closed_loop={'on' if ctx.get_config('closed_loop_enabled', True) else 'off'}, "
+        f"verify_gate={'on' if ctx.get_config('verify_gate_enabled', True) else 'off'})",
+        f"  Backend:  {backend} ({endpoint or 'not set'}) | secondary={secondary_ep or 'none'} | "
+        f"fallback={fallback} | keep_alive={'on' if ctx.get_config('keep_alive_enabled', True) else 'off'}",
         f"  Foundry API Key configured: {'yes' if has_foundry_key else 'no'}",
         (
             f"  Unique turns: {stats['total']} across {stats['total_steps']} API steps "
-            f"(S1: {stats['system1']}, S2: {stats['system2']}, Abstained->S2: {stats['abstained']}, "
-            f"Trap-guarded: {stats['trap_blocked']}, Step-paced: {stats['step_paced']}, Wire-guarded: {stats['wire_guarded']})"
+            f"(S1: {stats['system1']}, S2: {stats['system2']}, Fast-path S2: {stats['fast_pathed']}, "
+            f"Abstained->S2: {stats['abstained']}, Trap-guarded: {stats['trap_blocked']}, "
+            f"Step-paced: {stats['step_paced']}, Wire-guarded: {stats['wire_guarded']})"
         ),
     ]
     if stats["total"] > 0:
         s1_pct = (stats["system1"] / stats["total"]) * 100.0
         lines.append(
             f"  System-1 share: {s1_pct:.1f}% | Avg confidence (OK): {stats['avg_confidence']:.2f} | "
-            f"Triage latency p50/p95: {stats['p50_triage_ms']:.0f}/{stats['p95_triage_ms']:.0f} ms | "
-            f"Error rate: {stats['error_rate'] * 100.0:.1f}% | Est. Foundry S1 spend: ${stats['estimated_cost_usd']:.5f}"
+            f"Triage p50/p95: {stats['p50_triage_ms']:.0f}/{stats['p95_triage_ms']:.0f} ms | "
+            f"Error rate: {stats['error_rate'] * 100.0:.1f}% | False-S1 signals: {stats['false_s1_signals']}"
+        )
+        lines.append(
+            f"  KV Cache hit rate: {stats['cache_hit_rate'] * 100.0:.1f}% "
+            f"(read={stats['cache_read_tokens']}, write={stats['cache_write_tokens']}) | "
+            f"Avg provider step: {stats['avg_provider_duration_ms']:.0f} ms | "
+            f"Reasoning tokens: {stats['reasoning_tokens']} | Est. S1 spend: ${stats['estimated_cost_usd']:.5f}"
         )
 
-    if sub in ("last", "stats") and stats["recent"]:
+    if sub == "outcomes":
+        lines.append(f"  Closed-loop outcomes: {stats['outcomes_by_type']}")
+    elif sub in ("last", "stats") and stats["recent"]:
         lines.append("  Recent turns:")
         for item in stats["recent"]:
             flags = []
+            if item["fast_pathed"]:
+                flags.append("fast_path")
             if item["abstained"]:
                 flags.append("abstained")
             if item["trap_blocked"]:
                 flags.append("trap_guard")
+            if item["step_paced"]:
+                flags.append("step_paced")
+            if item["wire_guarded"]:
+                flags.append("wire_guard")
+            if item["turn_outcome"] != "clean":
+                flags.append(item["turn_outcome"])
             if item.get("steps", 1) > 1:
                 flags.append(f"steps={item['steps']}")
             if item["error"]:
@@ -502,6 +703,9 @@ def handle_slash_command(ctx: Any, raw_args: str, *, session_id: str = "") -> st
                 f"({item['triage_ms']:.0f}ms) -> {item['model'] or '(active)'}{flag_str}"
             )
     elif sub == "help":
-        lines.append("  Commands: /trismegistus [status | stats | last | mode <shadow|effort_only|tier_and_effort> | escalate]")
+        lines.append(
+            "  Commands: /trismegistus [status | stats | last | outcomes | calibrate | "
+            "mode <shadow|effort_only|tier_and_effort> | escalate]"
+        )
 
     return "\n".join(lines)

@@ -1,0 +1,59 @@
+{
+  "status": "completed",
+  "execution_kind": "offline_e2e_simulation",
+  "tasks_count": 30,
+  "policies": {
+    "baseline_s2": {
+      "policy": "baseline_s2",
+      "tasks_evaluated": 30,
+      "pass_at_1": 1.0,
+      "false_s1_count": 0,
+      "false_s1_rate": 0.0,
+      "wall_clock_ms": {
+        "mean": 28165.3,
+        "p50": 32580.0,
+        "p95": 53940.0
+      },
+      "triage_overhead_ms_mean": 0.0,
+      "fast_path_s2_hits": 0,
+      "step_paced_steps": 0,
+      "kv_cache_hit_rate": 0.6693
+    },
+    "effort_only": {
+      "policy": "effort_only",
+      "tasks_evaluated": 30,
+      "pass_at_1": 1.0,
+      "false_s1_count": 0,
+      "false_s1_rate": 0.0,
+      "wall_clock_ms": {
+        "mean": 16535.7,
+        "p50": 12710.1,
+        "p95": 43370.0
+      },
+      "triage_overhead_ms_mean": 95.36,
+      "fast_path_s2_hits": 4,
+      "step_paced_steps": 14,
+      "kv_cache_hit_rate": 0.6693
+    },
+    "tier_and_effort": {
+      "policy": "tier_and_effort",
+      "tasks_evaluated": 30,
+      "pass_at_1": 1.0,
+      "false_s1_count": 0,
+      "false_s1_rate": 0.0,
+      "wall_clock_ms": {
+        "mean": 16308.4,
+        "p50": 12710.1,
+        "p95": 43370.0
+      },
+      "triage_overhead_ms_mean": 95.36,
+      "fast_path_s2_hits": 4,
+      "step_paced_steps": 14,
+      "kv_cache_hit_rate": 0.6693
+    }
+  },
+  "speedup_vs_baseline": {
+    "effort_only_latency_reduction_pct": 41.29,
+    "tier_and_effort_latency_reduction_pct": 42.1
+  }
+}
