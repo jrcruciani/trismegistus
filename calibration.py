@@ -1,22 +1,29 @@
-"""Conformal risk-controlled threshold calibration & closed-loop precision guard.
+"""Empirical risk-aware threshold calibration & reactive closed-loop precision guard.
 
 Implements:
-1. Split Conformal / Finite-Sample Risk-Controlled Calibration (`calibrate_thresholds`):
+1. Empirical 2D Grid Threshold Calibration (`calibrate_thresholds`):
    Given labeled triage samples (each with `expected_effective_tier`, `raw_tier`, `confidence`,
-   `trap_risk_prob`, `effort_score`), finds the optimal `(confidence_threshold, trap_risk_threshold)`
-   pair that:
-   - Strictly controls the empirical `false_fast_route_rate` (must-escalate S2/trap routed to S1)
-     using a finite-sample conformal / Wilson upper bound `<= target_alpha` (precision first!),
-   - Among all risk-safe pairs, maximizes System-1 recall (speed!) with preference for stable
-     margins away from extreme degenerate thresholds.
+   `trap_risk_prob`, `effort_score`), searches a 2D candidate grid for a conservative
+   `(confidence_threshold, trap_risk_threshold)` pair that:
+   - Minimizes in-sample `false_fast_route_rate` (must-escalate S2/trap routed to S1) using a
+     descriptive finite-sample `+1` smoothing score `(ff + 1) / (n + 1)` and symmetric `0.005`
+     boundary margins (plus optional adversarial `rounding_epsilon` evaluation when recalibrating
+     from rounded scores),
+   - Among risk-safe candidates, maximizes System-1 recall (speed!) while preferring stable
+     margins away from razor edges.
+   NOTE: In-sample grid selection over labeled data is an empirical calibration heuristic, NOT a
+   formal out-of-sample conformal coverage guarantee. Validate selected thresholds on independent
+   held-out splits (or cross-validation + separate prospective evaluation) before trusting risk bounds.
 2. Backend-scoped persistence (`<HERMES_HOME>/plugin-data/trismegistus/calibration.json`) because
    probabilities from `foundry_systemone`, `local_logits`, and `hermes_aux` have distinct
    calibration curves and must never share thresholds blindly.
-3. Conservative Closed-Loop Online Hardening (`compute_closed_loop_adjustment`):
-   Observes real runtime failure signals on turns that started in System 1 (`false_s1_err_streak`,
-   `false_s1_escalated`, `false_s1_verify_failed`). When observed false-S1 rate exceeds budget
-   over a minimum sample window, tightens `(confidence_threshold, trap_risk_threshold)` upward
-   within bounded safety rails — never loosening below configured/calibrated precision floors.
+3. Reactive Sliding-Window Closed-Loop Guard (`compute_closed_loop_adjustment`):
+   Observes explicit runtime failure proxies on active-mode turns that started in System 1
+   (`false_s1_err_streak`, `false_s1_escalated`, `false_s1_verify_failed`). When observed proxy
+   rate exceeds `target_alpha` over a sliding window (`>= min_samples`), tightens
+   `(confidence_threshold, trap_risk_threshold)` monotonically *relative to the base floor within
+   that window* (never loosening below the base floor; returns to the base floor once a subsequent
+   sliding window is clean). Explicit proxies do not detect all silent quality errors.
 """
 
 from __future__ import annotations
@@ -89,12 +96,30 @@ def _would_route_s1(
     conf_threshold: float,
     trap_threshold: float,
     effort_floor: float = 1.85,
+    rounding_epsilon: float = 0.0,
+    adversarial_for: str | None = None,
 ) -> bool:
+    """Mirror `triage.py` exact runtime comparator (`>= conf`, `< trap`, `< effort_floor`).
+
+    When `rounding_epsilon > 0`, shifts observed scores in the worst-case direction for either
+    `'must_s2'` (harder to block: higher conf, lower trap/effort) or `'s1'` (harder to keep S1:
+    lower conf, higher trap/effort) so rounded inputs cannot hide razor-edge boundary flips.
+    """
     if str(sample.get("raw_tier") or "system2") != "system1":
         return False
     conf = float(sample.get("confidence", 0.0))
     trap = float(sample.get("trap_risk_prob", 0.0))
     effort = float(sample.get("effort_score", 2.5))
+    eps = max(0.0, float(rounding_epsilon))
+    if eps > 0.0:
+        if adversarial_for == "must_s2":
+            conf += eps
+            trap -= eps
+            effort -= eps
+        elif adversarial_for == "s1":
+            conf -= eps
+            trap += eps
+            effort += eps
     return conf >= conf_threshold and trap < trap_threshold and effort < effort_floor
 
 
@@ -108,13 +133,15 @@ def calibrate_thresholds(
     max_conf: float = 0.98,
     min_trap: float = 0.25,
     max_trap: float = 0.70,
+    rounding_epsilon: float = 0.0,
 ) -> CalibrationProfile:
-    """Compute conformal risk-controlled `(confidence_threshold, trap_risk_threshold)` for `backend`.
+    """Compute empirically calibrated `(confidence_threshold, trap_risk_threshold)` for `backend`.
 
-    For finite sample size `n_must_s2`, conformal risk control adds a `+1` smoothing numerator
-    `(false_fast_routes + 1) / (n_must_s2 + 1)` as well as computing the 95% Wilson upper bound.
-    We select the threshold pair that satisfies empirical `false_fast_route_rate <= target_alpha`
-    with minimal conformal risk and maximal System-1 recall (fastest safe operating point).
+    Uses a 2D candidate grid with symmetric `0.005` safety margins around observed `must_s2`
+    boundaries (never sitting directly on a razor edge), scoring candidates by descriptive
+    `+1` finite-sample smoothing `(false_fast_routes + 1) / (n_must_s2 + 1)` and System-1 recall.
+    Pass `rounding_epsilon=5e-5` when recalibrating from 4-decimal-rounded predictions to enforce
+    worst-case rounding invariance against the exact full-precision runtime comparator.
     """
     rows = [dict(s) for s in samples if s.get("error_category", "ok") == "ok"]
     must_s2 = [r for r in rows if str(r.get("expected_effective_tier") or "system2") == "system2"]
@@ -149,7 +176,7 @@ def calibrate_thresholds(
     for r in must_s2:
         if str(r.get("raw_tier")) == "system1":
             c = round(min(max_conf, max(min_conf, float(r.get("confidence", 0.0)) + 0.005)), 4)
-            t = round(min(max_trap, max(min_trap, float(r.get("trap_risk_prob", 0.50)))), 4)
+            t = round(min(max_trap, max(min_trap, float(r.get("trap_risk_prob", 0.50)) - 0.005)), 4)
             conf_grid.add(c)
             trap_grid.add(t)
 
@@ -157,7 +184,7 @@ def calibrate_thresholds(
     sorted_traps = sorted(trap_grid)
 
     # Evaluate candidates prioritizing:
-    # 1. Conformal risk bound <= target_alpha (or lowest possible risk if sample size is too small for strict bound)
+    # 1. Descriptive `+1` risk score <= target_alpha (or lowest possible risk if sample size is small)
     # 2. Empirical false_fast_route_rate <= target_alpha
     # 3. Maximum System-1 recall (speed!)
     # 4. Balanced margin close to canonical (0.82, 0.50) to avoid overfitting razor edges
@@ -170,12 +197,26 @@ def calibrate_thresholds(
             ff = sum(
                 1
                 for r in must_s2
-                if _would_route_s1(r, conf_threshold=ct, trap_threshold=tt, effort_floor=effort_floor)
+                if _would_route_s1(
+                    r,
+                    conf_threshold=ct,
+                    trap_threshold=tt,
+                    effort_floor=effort_floor,
+                    rounding_epsilon=rounding_epsilon,
+                    adversarial_for="must_s2",
+                )
             )
             tp_s1 = sum(
                 1
                 for r in true_s1
-                if _would_route_s1(r, conf_threshold=ct, trap_threshold=tt, effort_floor=effort_floor)
+                if _would_route_s1(
+                    r,
+                    conf_threshold=ct,
+                    trap_threshold=tt,
+                    effort_floor=effort_floor,
+                    rounding_epsilon=rounding_epsilon,
+                    adversarial_for="s1",
+                )
             )
             emp_ffr = ff / n_must_s2
             conformal_bound = (ff + 1.0) / (n_must_s2 + 1.0)

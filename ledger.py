@@ -212,17 +212,27 @@ def record_turn_outcome(turn_id: str, outcome: str) -> None:
             conn.close()
 
 
-def recent_closed_loop_window(backend: str, *, limit: int = 50) -> tuple[int, int]:
-    """Return `(recent_s1_turns, recent_false_s1_turns)` for `backend` from the local SQLite ledger."""
+def recent_closed_loop_window(
+    backend: str,
+    *,
+    limit: int = 50,
+    active_modes_only: bool = True,
+) -> tuple[int, int]:
+    """Return `(recent_s1_turns, recent_false_s1_turns)` for `backend` from the local SQLite ledger.
+
+    When `active_modes_only=True` (default), excludes `mode = 'shadow'` rows so non-mutating
+    shadow history cannot dilute closed-loop failure ratios once active modulation is enabled.
+    """
+    mode_filter = "AND mode != 'shadow'" if active_modes_only else ""
     with _db_lock:
         conn = open_plugin_db("trismegistus", "ledger.db")
         try:
             _ensure_schema(conn)
             cur = conn.execute(
-                """
+                f"""
                 SELECT turn_id, effective_tier, turn_outcome
                 FROM trismegistus_decisions
-                WHERE backend = ? AND step_index = 1 AND error = '' AND fast_pathed = 0
+                WHERE backend = ? AND step_index = 1 AND error = '' AND fast_pathed = 0 {mode_filter}
                 ORDER BY id DESC
                 LIMIT ?
                 """,
@@ -664,7 +674,7 @@ def handle_slash_command(ctx: Any, raw_args: str, *, session_id: str = "") -> st
     has_foundry_key = bool(read_secret("TRISMEGISTUS_FOUNDRY_API_KEY"))
 
     lines = [
-        "Trismegistus v0.3.2 — Precision & Speed Cognitive Router",
+        "Trismegistus v0.3.3 — Precision & Speed Cognitive Router",
         f"  Mode:     {mode} (step_pacing={'on' if ctx.get_config('step_pacing_enabled', True) else 'off'}, "
         f"fast_path={'on' if ctx.get_config('fast_path_enabled', True) else 'off'}, "
         f"closed_loop={'on' if ctx.get_config('closed_loop_enabled', True) else 'off'}, "
