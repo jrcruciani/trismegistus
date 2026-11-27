@@ -643,3 +643,164 @@ def test_hermes_top_level_cache_read_tokens_and_closed_loop_monotonicity_regress
     assert c_mix2 > 0.82 and c_mix2 <= 0.96
     assert t_mix2 == 0.25
     assert tightened_mix2 is True
+
+
+def test_v032_additive_cache_hit_rate_and_degraded_benchmark_calibration_guard(pkg):
+    """Regression tests for v0.3.2: additive cache accounting & degraded benchmark calibration refusal."""
+    import tempfile
+    from test_pipeline import _StubPluginContext
+
+    # 1. Additive provider accounting (e.g. mai-code-2 / Anthropic where input_tokens excludes cache_read_tokens)
+    ctx = _StubPluginContext(
+        config={"mode": "shadow", "backend": "hermes_aux", "use_calibrated_thresholds": False, "closed_loop_enabled": False},
+        scripted_decisions=[
+            {
+                "tier": {"choice": "system1", "confidence": 0.96},
+                "effort": {"score": 0.4, "confidence": 0.90},
+                "trap_risk": {"noul": 0.05},
+                "needs_plan": {"noul": 0.05},
+            },
+            {
+                "tier": {"choice": "system1", "confidence": 0.96},
+                "effort": {"score": 0.4, "confidence": 0.90},
+                "trap_risk": {"noul": 0.05},
+                "needs_plan": {"noul": 0.05},
+            },
+        ],
+    )
+    pkg.register(ctx)
+    # Step 1: cache_read_tokens > input_tokens (observed live on mai-code-2: 3391 uncached + 112128 cached)
+    ctx.hooks["pre_llm_call"](session_id="ses_add", user_message="Summarize status", model="mai-code-2")
+    ctx.middleware["llm_request"](
+        request={"model": "mai-code-2", "messages": []},
+        session_id="ses_add",
+        provider="copilot",
+        model="mai-code-2",
+        api_mode="chat_completions",
+        api_call_count=1,
+    )
+    ctx.hooks["post_api_request"](
+        session_id="ses_add",
+        api_duration=0.40,
+        usage={"input_tokens": 3391, "output_tokens": 80, "cache_read_tokens": 112128, "cache_write_tokens": 0},
+    )
+    stats_single = pkg.ledger.read_summary_stats(limit_recent=5)
+    expected_single = round(112128 / (3391 + 112128), 4)
+    assert stats_single["cache_read_tokens"] == 112128
+    assert abs(stats_single["cache_hit_rate"] - expected_single) < 1e-4
+    assert stats_single["cache_hit_rate"] < 0.99  # Must NOT inflate to 1.0
+
+    # Step 2: same additive model with smaller cache_read_tokens <= input_tokens still uses additive total
+    ctx.hooks["pre_llm_call"](session_id="ses_add2", user_message="Summarize again", model="mai-code-2")
+    ctx.middleware["llm_request"](
+        request={"model": "mai-code-2", "messages": []},
+        session_id="ses_add2",
+        provider="copilot",
+        model="mai-code-2",
+        api_mode="chat_completions",
+        api_call_count=1,
+    )
+    ctx.hooks["post_api_request"](
+        session_id="ses_add2",
+        api_duration=0.25,
+        usage={"input_tokens": 20000, "output_tokens": 50, "cache_read_tokens": 10000, "cache_write_tokens": 0},
+    )
+    stats_both = pkg.ledger.read_summary_stats(limit_recent=5)
+    expected_both = round((112128 + 10000) / ((3391 + 112128) + (20000 + 10000)), 4)
+    assert abs(stats_both["cache_hit_rate"] - expected_both) < 1e-4
+
+    # 2. Degraded benchmark guard: high 429 error_rate must mark status='degraded' and refuse overwriting calibration.json
+    bench_path = ROOT / "benchmarks" / "run_heldout.py"
+    spec = importlib.util.spec_from_file_location("trismegistus_heldout_v032", str(bench_path))
+    assert spec is not None and spec.loader is not None
+    bench_mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bench_mod
+    spec.loader.exec_module(bench_mod)
+
+    synthetic_degraded = [
+        {
+            "id": "s1_001",
+            "label": "s1",
+            "subcategory": "t",
+            "expected_effective_tier": "system1",
+            "raw_tier": "system1",
+            "effective_tier": "system1",
+            "effective_effort": "low",
+            "effort_score": 0.8,
+            "confidence": 0.99,
+            "trap_risk_prob": 0.1,
+            "abstained": False,
+            "trap_blocked": False,
+            "latency_ms": 150.0,
+            "input_tokens": 500,
+            "error_category": "ok",
+            "mutated_request": False,
+        },
+        {
+            "id": "amb_001",
+            "label": "ambiguous_trap",
+            "subcategory": "t",
+            "expected_effective_tier": "system2",
+            "raw_tier": "system2",
+            "effective_tier": "system2",
+            "effective_effort": "high",
+            "effort_score": 2.5,
+            "confidence": 0.85,
+            "trap_risk_prob": 0.8,
+            "abstained": False,
+            "trap_blocked": False,
+            "latency_ms": 180.0,
+            "input_tokens": 520,
+            "error_category": "ok",
+            "mutated_request": False,
+        },
+    ] + [
+        {
+            "id": f"err_{i:03d}",
+            "label": "s2",
+            "subcategory": "t",
+            "expected_effective_tier": "system2",
+            "raw_tier": "system2",
+            "effective_tier": "system2",
+            "effective_effort": "high",
+            "effort_score": 2.5,
+            "confidence": 0.0,
+            "trap_risk_prob": 0.0,
+            "abstained": True,
+            "trap_blocked": False,
+            "latency_ms": 0.0,
+            "input_tokens": 0,
+            "error_category": "http_429",
+            "mutated_request": False,
+        }
+        for i in range(98)
+    ]
+    metrics = bench_mod.compute_benchmark_metrics(
+        synthetic_degraded,
+        backend="foundry_systemone",
+        execution_kind="live_backend",
+        dataset_path=ROOT / "benchmarks" / "heldout_300.jsonl",
+        max_error_rate=0.10,
+    )
+    assert metrics["status"] == "degraded"
+    assert metrics["errors"]["ok_turns"] == 2
+    assert metrics["errors"]["error_turns"] == 98
+    assert "degraded_reason" in metrics
+
+    # Verify offline_wire_harness with incomplete class mix refuses to overwrite an existing calibration.json
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cal_file = Path(tmpdir) / "calibration.json"
+        cal_file.write_text('{"sentinel": true}\n', encoding="utf-8")
+        guarded = bench_mod.run_benchmark(
+            backend="offline_wire_harness",
+            pacing_ms=0.0,
+            limit=10,
+            calibrate=True,
+            save_calibration_path=cal_file,
+            min_calibration_samples=50,
+        )
+        # limit=10 caps required_samples to 10; offline harness has 10 s1 turns -> n_must_s2=0 -> still invalid!
+        assert guarded["conformal_calibration_valid"] is False
+        assert "conformal_calibration_skipped_reason" in guarded
+        assert "conformal_calibration_saved_to" not in guarded
+        assert cal_file.read_text(encoding="utf-8") == '{"sentinel": true}\n'

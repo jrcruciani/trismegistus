@@ -1,4 +1,4 @@
-# Trismegistus (`v0.3.1`)
+# Trismegistus (`v0.3.2`)
 
 **Precision & speed System-1 / System-2 cognitive router for [Hermes Agent](https://github.com/NousResearch/hermes-agent)** (`Triage → Modulation → Call`).
 
@@ -30,7 +30,7 @@ pre_llm_call / pre_tool_call                         llm_request middleware     
 
 ---
 
-## Key Capabilities & Resilience (`v0.3.0`)
+## Key Capabilities & Resilience (`v0.3.2`)
 
 1. **Zero-Generation Multimodal Triage + Same-Model Failover (`backends.py` / `triage.py`)**:
    - `Microsoft-Decision-1.1` evaluates **four orthogonal questions in a single forward pass** (`tier`, `effort`, `trap_risk`, `needs_plan`) with `0` generated tokens (`$0.042 / 1M` input tokens).
@@ -70,9 +70,29 @@ hermes config set plugins.entries.trismegistus.settings.foundry_endpoint "https:
 hermes config set plugins.entries.trismegistus.settings.foundry_deployment "microsoft-decision-1.1"
 hermes config set plugins.entries.trismegistus.settings.mode shadow
 
-# Run the 300-turn held-out shadow benchmark (~$0.007 total on Foundry)
-python3 benchmarks/run_heldout.py --backend foundry_systemone --pacing-ms 220 --output benchmarks/results/foundry_heldout_300.json
+# Run the 300-turn held-out shadow benchmark (~$0.007 total on Foundry) and generate conformal thresholds
+python3 benchmarks/run_heldout.py --backend foundry_systemone --pacing-ms 550 --calibrate --target-alpha 0.02 --apply-calibration --output benchmarks/results/foundry_heldout_300.json
 ```
+
+> **Microsoft Foundry deployment notes (important for zero `429` / `401` errors):**
+> - Set `Microsoft-Decision-1.1` deployment `sku.capacity` to at least **`20`–`100`** (`20K–100K TPM` on `GlobalStandard`, pay-as-you-go with no fixed reservation cost). Leaving `capacity=1` caps the deployment at **`1 RPM / 1K TPM`**, causing `HTTP 429` bursts whenever two user turns arrive within 60 seconds or during benchmarking.
+> - If authenticating with Entra ID bearer JWTs refreshed via `az account get-access-token`, schedule the refresh job every **`5` minutes (`*/5 * * * *`)** rather than every 30 minutes — MSAL reuses its cached token until `<5 min` remain before expiry, so a 30-minute cron can leave 15–25 minute expired-token windows.
+
+---
+
+## Verified Live Benchmark (`Microsoft-Decision-1.1` on Microsoft Foundry)
+
+Measured live on `benchmarks/heldout_300.jsonl` (`300/300` OK, `0` errors, `GlobalStandard capacity=100` in `swedencentral`, `shadow` mode, `0` mutations; full report in [`benchmarks/results/heldout_300_live_foundry.json`](benchmarks/results/heldout_300_live_foundry.json)):
+
+| Metric | Default (`0.82 / 0.50`) | Split-Conformal (`0.8993 / 0.4749`, `alpha=0.02`) |
+|---|---|---|
+| Overall effective accuracy (`300` turns) | **`98.67%`** (`296/300`) | **`100.0%`** in-sample / **`99.0%`** 5-fold OOS |
+| `s1` recall (`100` simple turns) | **`100.0%`** (`100/100`) | **`100.0%`** (`100/100`, 5-fold OOS: `100.0%`) |
+| `s2` recall (`100` complex turns) | **`100.0%`** (`100/100`) | **`100.0%`** (`100/100`) |
+| `ambiguous_trap` caught (`100` traps) | **`96.0%`** (`96/100`) | **`100.0%`** in-sample / **`97.0%`** 5-fold OOS |
+| `false_fast_route_rate` (`200` must-S2) | `2.00%` (`4/200`) | **`0.00%`** in-sample (`Wilson95 <= 1.88%`) / **`1.50%`** 5-fold OOS (`3/200`) |
+| Warm Keep-Alive latency (`p50` / `p95` / `p99`) | **`108.2 ms` / `136.4 ms` / `157.4 ms`** | *(same)* |
+| Total Foundry cost (`300` turns, `160,471` input tokens) | **`$0.00674`** (~`$0.000022`/turn) | *(same)* |
 
 ---
 
@@ -101,9 +121,9 @@ python3 benchmarks/run_heldout.py --backend foundry_systemone --pacing-ms 220 --
 
 ## Privacy & Security Disclosure (Hermes Plugin Catalog Rule 13)
 
-- **Network calls**: When `backend` is `foundry_systemone` (and `TRISMEGISTUS_FOUNDRY_API_KEY` + `foundry_endpoint` are configured), Trismegistus sends a force-redacted excerpt of the current user turn (`max_excerpt_chars`, default 2,400 chars) and a short tail digest (up to 800 chars) over a verified TLS 1.3 connection (`KeepAliveHttpPool`, no cross-origin redirect forwarding) to `<foundry_endpoint>/providers/microsoft/v1/systemone` once per user turn (`shadow` mode included), plus redacted tool arguments / changed file paths when `tool_gate_enabled` or `verify_gate_enabled` run in active modes. With `local_systemone` or `local_logits`, requests go only to your configured `local_endpoint`. With `hermes_aux`, calls route through Hermes's host-owned `ctx.llm` on `auxiliary.trismegistus_decider`.
-- **Secret handling**: Secrets (`TRISMEGISTUS_FOUNDRY_API_KEY`, `TRISMEGISTUS_LOCAL_API_KEY`) are read exclusively via Hermes's documented secret APIs (`agent.secret_scope` / `hermes_cli.config.get_env_value_prefer_dotenv`), never from raw credential files, and all outbound text is scrubbed with `agent.redact.redact_sensitive_text(..., force=True)`.
-- **Local storage**: Writes non-message telemetry metrics (timestamps, `turn_id`, `step_index`, tier, effort, confidence, `trap_risk`, latencies, model IDs — never prompt text) to `<HERMES_HOME>/plugin-data/trismegistus/ledger.db`.
+- **Network calls**: When `backend` is `foundry_systemone` (and `TRISMEGISTUS_FOUNDRY_API_KEY` + `foundry_endpoint` are configured), Trismegistus sends a force-redacted head+tail excerpt of the current user turn (`max_excerpt_chars`, default 4,000 chars) and optional bounded image attachments (when `multimodal_triage_enabled` is true) over a verified TLS 1.3 connection (`KeepAliveHttpPool`, no cross-origin redirect forwarding) to `<foundry_endpoint>/providers/microsoft/v1/systemone` once per user turn (`shadow` mode included) — or, on failover when `secondary_systemone_endpoint` is explicitly configured, to that secondary `Microsoft-Decision-1.1` endpoint (OpenRouter, Vercel AI Gateway, or secondary Foundry) — plus redacted tool arguments / changed file paths when `tool_gate_enabled` or `verify_gate_enabled` run in active modes. With `local_systemone` or `local_logits`, requests go only to your configured `local_endpoint`. With `hermes_aux`, calls route through Hermes's host-owned `ctx.llm` on `auxiliary.trismegistus_decider`.
+- **Secret handling**: Secrets (`TRISMEGISTUS_FOUNDRY_API_KEY`, `TRISMEGISTUS_SECONDARY_API_KEY`, `TRISMEGISTUS_LOCAL_API_KEY`) are read exclusively via Hermes's documented secret APIs (`agent.secret_scope` / `hermes_cli.config.get_env_value_prefer_dotenv`), never from raw credential files, and all outbound text is scrubbed with `agent.redact.redact_sensitive_text(..., force=True)`.
+- **Local storage**: Writes non-message telemetry metrics (timestamps, `turn_id`, `step_index`, tier, effort, confidence, `trap_risk`, latencies, token/cache counters, model IDs — never prompt text) to `<HERMES_HOME>/plugin-data/trismegistus/ledger.db` and optional per-backend conformal threshold profiles to `<HERMES_HOME>/plugin-data/trismegistus/calibration.json`.
 - **No core overrides**: Uses only documented Hermes public plugin APIs; compatible with `plugins.isolation: host`.
 
 ---
