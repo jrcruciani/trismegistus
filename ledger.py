@@ -250,6 +250,16 @@ def _deduplicate_turns_from_rows(rows: list[tuple[Any, ...]]) -> tuple[list[dict
     unique_turns: list[dict[str, Any]] = []
     seen_turn_ids: dict[str, int] = {}
     last_legacy_by_session: dict[str, tuple[tuple[Any, ...], float, int]] = {}
+    # Detect models whose provider reports `provider_input_tokens` EXCLUDING `cache_read_tokens`
+    # (additive accounting, e.g. Anthropic / mai-code-2 where `cache_read_tokens > provider_input_tokens`).
+    additive_cache_models: set[str] = set()
+    for r in rows:
+        r_model = str(r[20] or "").strip().lower()
+        r_pin = int(r[23] or 0)
+        r_cread = int(r[25] or 0)
+        if r_cread > r_pin and r_model:
+            additive_cache_models.add(r_model)
+
     step_flags: dict[str, Any] = {
         "total_steps": len(rows),
         "step_paced": 0,
@@ -260,6 +270,7 @@ def _deduplicate_turns_from_rows(rows: list[tuple[Any, ...]]) -> tuple[list[dict
         "provider_output_tokens": 0,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "cache_total_input_tokens": 0,
         "reasoning_tokens": 0,
     }
     step_error_counts: Counter[str] = Counter()
@@ -304,10 +315,18 @@ def _deduplicate_turns_from_rows(rows: list[tuple[Any, ...]]) -> tuple[list[dict
         if float(p_dur or 0.0) > 0:
             step_flags["provider_duration_ms_sum"] += float(p_dur)
             step_flags["provider_duration_count"] += 1
-        step_flags["provider_input_tokens"] += int(p_in or 0)
+        p_in_val = int(p_in or 0)
+        c_read_val = int(c_read or 0)
+        c_write_val = int(c_write or 0)
+        step_flags["provider_input_tokens"] += p_in_val
         step_flags["provider_output_tokens"] += int(p_out or 0)
-        step_flags["cache_read_tokens"] += int(c_read or 0)
-        step_flags["cache_write_tokens"] += int(c_write or 0)
+        step_flags["cache_read_tokens"] += c_read_val
+        step_flags["cache_write_tokens"] += c_write_val
+        model_key = str(amodel or "").strip().lower()
+        if c_read_val > p_in_val or (model_key and model_key in additive_cache_models):
+            step_flags["cache_total_input_tokens"] += p_in_val + c_read_val + c_write_val
+        else:
+            step_flags["cache_total_input_tokens"] += p_in_val + c_write_val
         step_flags["reasoning_tokens"] += int(r_tok or 0)
         step_error_counts[classify_error_category(err)] += 1
 
@@ -525,8 +544,8 @@ def audit_ledger_db(db_path: str | Path | None = None, *, limit_recent: int = 5)
     c_read_total = int(step_flags["cache_read_tokens"])
     c_write_total = int(step_flags["cache_write_tokens"])
     r_tok_total = int(step_flags["reasoning_tokens"])
-    cache_denom = max(p_in_total, c_read_total)
-    cache_hit_rate = round(c_read_total / cache_denom, 4) if cache_denom > 0 else 0.0
+    cache_denom = int(step_flags.get("cache_total_input_tokens") or 0) or max(p_in_total, c_read_total)
+    cache_hit_rate = round(min(1.0, c_read_total / cache_denom), 4) if cache_denom > 0 else 0.0
     avg_prov_ms = (
         round(step_flags["provider_duration_ms_sum"] / step_flags["provider_duration_count"], 2)
         if step_flags["provider_duration_count"] > 0
@@ -645,7 +664,7 @@ def handle_slash_command(ctx: Any, raw_args: str, *, session_id: str = "") -> st
     has_foundry_key = bool(read_secret("TRISMEGISTUS_FOUNDRY_API_KEY"))
 
     lines = [
-        "Trismegistus v0.3.1 — Precision & Speed Cognitive Router",
+        "Trismegistus v0.3.2 — Precision & Speed Cognitive Router",
         f"  Mode:     {mode} (step_pacing={'on' if ctx.get_config('step_pacing_enabled', True) else 'off'}, "
         f"fast_path={'on' if ctx.get_config('fast_path_enabled', True) else 'off'}, "
         f"closed_loop={'on' if ctx.get_config('closed_loop_enabled', True) else 'off'}, "

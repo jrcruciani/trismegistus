@@ -33,7 +33,7 @@ from .triage import (
     run_turn_triage,
 )
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 _CONSTANT_SYSTEM2_PLAN_NOTE = (
     "[Trismegistus System-2 Note: High structural complexity detected. "

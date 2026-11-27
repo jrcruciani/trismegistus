@@ -1,0 +1,118 @@
+{
+  "status": "completed",
+  "execution_kind": "live_backend",
+  "backend": "foundry_systemone",
+  "deployment_profile": {
+    "model": "Microsoft-Decision-1.1",
+    "version": "1",
+    "sku": "GlobalStandard",
+    "capacity_ktpm": 100,
+    "region": "swedencentral"
+  },
+  "mode_enforced": "shadow",
+  "shadow_mutations_detected": 0,
+  "dataset": "benchmarks/heldout_300.jsonl",
+  "independent_turns_evaluated": 300,
+  "overall_effective_accuracy": 0.9867,
+  "precision_by_regime": {
+    "system1_precision": 0.9615,
+    "system1_recall": 1.0,
+    "system2_precision": 1.0,
+    "system2_recall_all_must_escalate": 0.98
+  },
+  "per_class": {
+    "s1": {
+      "count": 100,
+      "expected_effective_tier": "system1",
+      "routed_system1": 100,
+      "routed_system2": 0,
+      "class_accuracy": 1.0,
+      "class_accuracy_wilson95": [0.963, 1.0],
+      "abstained_count": 0,
+      "abstained_rate": 0.0,
+      "trap_blocked_count": 0,
+      "trap_blocked_rate": 0.0
+    },
+    "s2": {
+      "count": 100,
+      "expected_effective_tier": "system2",
+      "routed_system1": 0,
+      "routed_system2": 100,
+      "class_accuracy": 1.0,
+      "class_accuracy_wilson95": [0.963, 1.0],
+      "abstained_count": 0,
+      "abstained_rate": 0.0,
+      "trap_blocked_count": 0,
+      "trap_blocked_rate": 0.0
+    },
+    "ambiguous_trap": {
+      "count": 100,
+      "expected_effective_tier": "system2",
+      "routed_system1": 4,
+      "routed_system2": 96,
+      "class_accuracy": 0.96,
+      "class_accuracy_wilson95": [0.9016, 0.9843],
+      "abstained_count": 24,
+      "abstained_rate": 0.24,
+      "trap_blocked_count": 6,
+      "trap_blocked_rate": 0.06
+    }
+  },
+  "routing_risk_metrics": {
+    "false_fast_route_count": 4,
+    "false_fast_route_rate": 0.02,
+    "false_fast_route_wilson95": [0.0078, 0.0503],
+    "s2_false_fast_route_rate": 0.0,
+    "ambiguous_trap_false_fast_route_rate": 0.04,
+    "false_escalation_count": 0,
+    "false_escalation_rate": 0.0,
+    "false_escalation_wilson95": [0.0, 0.037]
+  },
+  "abstention_and_guards": {
+    "abstained_total": 24,
+    "abstention_rate": 0.08,
+    "trap_blocked_total": 6,
+    "trap_guard_rate": 0.02
+  },
+  "latency_ms": {
+    "p50": 108.24,
+    "p95": 136.36,
+    "p99": 157.44,
+    "mean": 113.69
+  },
+  "errors": {
+    "ok_turns": 300,
+    "error_turns": 0,
+    "error_rate": 0.0,
+    "by_category": {
+      "ok": 300
+    }
+  },
+  "cost": {
+    "decision_input_tokens": 160471,
+    "decision_output_tokens": 0,
+    "estimated_foundry_cost_usd": 0.00674
+  },
+  "conformal_calibration": {
+    "backend": "foundry_systemone",
+    "confidence_threshold": 0.8993,
+    "trap_risk_threshold": 0.4749,
+    "target_alpha": 0.02,
+    "n_total": 300,
+    "n_must_s2": 200,
+    "n_s1": 100,
+    "empirical_false_fast_route_rate": 0.0,
+    "wilson95_false_fast_route_upper": 0.0188,
+    "conformal_risk_bound": 0.005,
+    "achieved_s1_recall": 1.0
+  },
+  "five_fold_oos_validation": {
+    "folds": 5,
+    "target_alpha": 0.02,
+    "oos_false_fast_route_count": 3,
+    "oos_false_fast_route_total_must_s2": 200,
+    "oos_false_fast_route_rate": 0.015,
+    "oos_s1_recall": 1.0
+  },
+  "wall_clock_seconds": 199.29
+}

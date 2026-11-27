@@ -306,6 +306,7 @@ def compute_benchmark_metrics(
     backend: str,
     execution_kind: str,
     dataset_path: Path,
+    max_error_rate: float = 0.10,
 ) -> dict[str, Any]:
     total = len(results)
     by_label: dict[str, list[dict[str, Any]]] = {"s1": [], "s2": [], "ambiguous_trap": []}
@@ -359,8 +360,11 @@ def compute_benchmark_metrics(
             "trap_blocked_rate": round(trap / n, 4) if n else 0.0,
         }
 
-    return {
-        "status": "completed",
+    ok_total = err_counts.get("ok", 0)
+    err_rate = round(err_total / total, 4) if total else 0.0
+    is_degraded = (total == 0) or (err_rate > float(max_error_rate))
+    report: dict[str, Any] = {
+        "status": "degraded" if is_degraded else "completed",
         "execution_kind": execution_kind,
         "backend": backend,
         "mode_enforced": "shadow",
@@ -402,8 +406,9 @@ def compute_benchmark_metrics(
             "mean": round((sum(ok_lats) / len(ok_lats)) if ok_lats else ((sum(lats) / len(lats)) if lats else 0.0), 2),
         },
         "errors": {
+            "ok_turns": ok_total,
             "error_turns": err_total,
-            "error_rate": round(err_total / total, 4) if total else 0.0,
+            "error_rate": err_rate,
             "by_category": dict(err_counts),
         },
         "cost": {
@@ -412,6 +417,12 @@ def compute_benchmark_metrics(
             "estimated_foundry_cost_usd": round((in_tokens / 1_000_000.0) * FOUNDRY_PRICE_PER_1M_INPUT_USD, 6),
         },
     }
+    if is_degraded:
+        report["degraded_reason"] = (
+            f"error_rate {err_rate:.2%} exceeded max_error_rate {float(max_error_rate):.2%} "
+            f"({err_total}/{total} turns failed; ok_turns={ok_total})"
+        )
+    return report
 
 
 def run_benchmark(
@@ -430,6 +441,8 @@ def run_benchmark(
     apply_calibration: bool = False,
     save_calibration_path: Path | None = None,
     include_predictions: bool = False,
+    max_error_rate: float = 0.10,
+    min_calibration_samples: int = 50,
 ) -> dict[str, Any]:
     pkg = _load_trismegistus_pkg()
     pkg.backends.clear_backend_caches()
@@ -556,6 +569,7 @@ def run_benchmark(
         backend=backend,
         execution_kind="offline_wire_harness" if is_offline else "live_backend",
         dataset_path=dataset_path,
+        max_error_rate=max_error_rate,
     )
     if calibrate:
         cal_backend = "foundry_systemone" if is_offline else backend
@@ -565,12 +579,31 @@ def run_benchmark(
             target_alpha=target_alpha,
         )
         report["conformal_calibration"] = cal_profile.to_dict()
+        required_samples = (
+            min(int(min_calibration_samples), len(results))
+            if (limit is not None and limit > 0)
+            else int(min_calibration_samples)
+        )
+        cal_valid = (
+            report.get("status") == "completed"
+            and cal_profile.n_total >= required_samples
+            and cal_profile.n_must_s2 >= 1
+            and cal_profile.n_s1 >= 1
+        )
+        report["conformal_calibration_valid"] = cal_valid
         if apply_calibration or save_calibration_path is not None:
-            saved_to = pkg.calibration.save_calibration_profile(
-                cal_profile,
-                path=save_calibration_path,
-            )
-            report["conformal_calibration_saved_to"] = str(saved_to)
+            if cal_valid:
+                saved_to = pkg.calibration.save_calibration_profile(
+                    cal_profile,
+                    path=save_calibration_path,
+                )
+                report["conformal_calibration_saved_to"] = str(saved_to)
+            else:
+                report["conformal_calibration_skipped_reason"] = (
+                    f"Refused to persist invalid calibration profile: status={report.get('status')!r}, "
+                    f"n_total={cal_profile.n_total} (required >= {required_samples}), "
+                    f"n_s1={cal_profile.n_s1}, n_must_s2={cal_profile.n_must_s2}"
+                )
     if include_predictions:
         report["predictions"] = results
     return report
@@ -596,6 +629,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-alpha", type=float, default=0.02, help="Max target false_fast_route_rate for conformal calibration.")
     parser.add_argument("--apply-calibration", action="store_true", help="Persist conformal calibration profile into active HERMES_HOME plugin-data.")
     parser.add_argument("--save-calibration", type=Path, default=None, help="Write conformal calibration profile to an explicit JSON path.")
+    parser.add_argument("--max-error-rate", type=float, default=0.10, help="Mark benchmark degraded and refuse calibration save above this error rate.")
+    parser.add_argument("--min-calibration-samples", type=int, default=50, help="Minimum OK turns required before persisting a conformal calibration profile.")
     parser.add_argument("--dump-predictions", action="store_true", help="Include per-turn raw verdicts in JSON output.")
     parser.add_argument("--audit-ledger", type=Path, default=None, help="Audit and deduplicate an existing SQLite ledger.db read-only.")
     parser.add_argument("--output", type=Path, default=None, help="Write JSON report to file.")
@@ -620,6 +655,8 @@ def main(argv: list[str] | None = None) -> int:
             apply_calibration=args.apply_calibration,
             save_calibration_path=args.save_calibration,
             include_predictions=args.dump_predictions,
+            max_error_rate=args.max_error_rate,
+            min_calibration_samples=args.min_calibration_samples,
         )
 
     serialized = json.dumps(report, indent=2, ensure_ascii=False)

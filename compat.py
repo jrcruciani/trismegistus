@@ -144,9 +144,9 @@ def user_agent() -> str:
     try:
         from hermes_cli.version_info import hermes_user_agent
 
-        return hermes_user_agent("trismegistus/0.3.1")
+        return hermes_user_agent("trismegistus/0.3.2")
     except ImportError:
-        return "Hermes-Trismegistus/0.3.1"
+        return "Hermes-Trismegistus/0.3.2"
 
 
 def plugin_data_dir(plugin_name: str = "trismegistus") -> Path:
