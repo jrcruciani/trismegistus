@@ -804,3 +804,90 @@ def test_v032_additive_cache_hit_rate_and_degraded_benchmark_calibration_guard(p
         assert "conformal_calibration_skipped_reason" in guarded
         assert "conformal_calibration_saved_to" not in guarded
         assert cal_file.read_text(encoding="utf-8") == '{"sentinel": true}\n'
+
+
+def test_v033_rounding_boundary_margin_full_precision_and_active_closed_loop_window(pkg):
+    """Regression tests for v0.3.3: symmetric trap margin, adversarial rounding_epsilon, and shadow-excluded closed-loop."""
+    from test_pipeline import _StubPluginContext
+
+    # 1. Symmetric trap boundary margin + adversarial rounding_epsilon=5e-5 prevents razor-edge flips (e.g. 0.4749 vs 0.47489)
+    samples = []
+    for i in range(60):
+        samples.append(
+            {
+                "expected_effective_tier": "system1",
+                "raw_tier": "system1",
+                "confidence": 0.96,
+                "trap_risk_prob": 0.15,
+                "effort_score": 0.4,
+                "error_category": "ok",
+            }
+        )
+    for i in range(100):
+        samples.append(
+            {
+                "expected_effective_tier": "system2",
+                "raw_tier": "system1" if i == 0 else "system2",
+                "confidence": 0.9459 if i == 0 else 0.90,
+                "trap_risk_prob": 0.4749 if i == 0 else 0.85,
+                "effort_score": 0.35 if i == 0 else 3.0,
+                "error_category": "ok",
+            }
+        )
+    prof = pkg.calibration.calibrate_thresholds(
+        samples,
+        backend="foundry_systemone",
+        target_alpha=0.02,
+        rounding_epsilon=5e-5,
+    )
+    # Must block even an adversarial unrounded true value of 0.47485 (which rounds to 0.4749)
+    assert prof.trap_risk_threshold <= 0.47485
+    assert not pkg.calibration._would_route_s1(
+        {"raw_tier": "system1", "confidence": 0.94594, "trap_risk_prob": 0.47486, "effort_score": 0.35},
+        conf_threshold=prof.confidence_threshold,
+        trap_threshold=prof.trap_risk_threshold,
+    )
+    assert prof.achieved_s1_recall == 1.0
+
+    # 2. recent_closed_loop_window(active_modes_only=True) excludes `mode='shadow'` rows so shadow history never dilutes active signals
+    ctx_shadow = _StubPluginContext(
+        config={"mode": "shadow", "backend": "hermes_aux", "use_calibrated_thresholds": False, "closed_loop_enabled": False},
+        scripted_decisions=[
+            {
+                "tier": {"choice": "system1", "confidence": 0.97},
+                "effort": {"score": 0.3, "confidence": 0.92},
+                "trap_risk": {"noul": 0.05},
+                "needs_plan": {"noul": 0.05},
+            }
+            for _ in range(12)
+        ],
+    )
+    pkg.register(ctx_shadow)
+    for i in range(12):
+        ctx_shadow.hooks["pre_llm_call"](session_id=f"sh_{i}", user_message="Hi", model="gpt-5.4")
+        ctx_shadow.hooks["post_api_request"](session_id=f"sh_{i}", api_duration=0.1, usage={"input_tokens": 100, "output_tokens": 10})
+
+    # Shadow turns must NOT appear in active-only closed-loop window
+    s1_act_before, f_act_before = pkg.ledger.recent_closed_loop_window("hermes_aux", limit=50, active_modes_only=True)
+    s1_all_before, _ = pkg.ledger.recent_closed_loop_window("hermes_aux", limit=50, active_modes_only=False)
+    assert s1_act_before == 0 and f_act_before == 0
+    assert s1_all_before >= 12
+
+    # Active effort_only turn with escalation IS counted without shadow dilution
+    ctx_active = _StubPluginContext(
+        config={"mode": "effort_only", "backend": "hermes_aux", "use_calibrated_thresholds": False, "closed_loop_enabled": False},
+        scripted_decisions=[
+            {
+                "tier": {"choice": "system1", "confidence": 0.97},
+                "effort": {"score": 0.3, "confidence": 0.92},
+                "trap_risk": {"noul": 0.05},
+                "needs_plan": {"noul": 0.05},
+            }
+        ],
+    )
+    pkg.register(ctx_active)
+    ctx_active.hooks["pre_llm_call"](session_id="act_1", user_message="Quick task", model="gpt-5.4")
+    ctx_active.hooks["post_api_request"](session_id="act_1", api_duration=0.1, usage={"input_tokens": 100, "output_tokens": 10})
+    ctx_active.tools["trismegistus_escalate"]["handler"]({"reason": "Needed deeper pass"}, session_id="act_1")
+    s1_act_after, f_act_after = pkg.ledger.recent_closed_loop_window("hermes_aux", limit=50, active_modes_only=True)
+    assert s1_act_after == 1 and f_act_after == 1

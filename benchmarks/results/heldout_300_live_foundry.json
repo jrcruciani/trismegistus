@@ -96,23 +96,40 @@
   "conformal_calibration": {
     "backend": "foundry_systemone",
     "confidence_threshold": 0.8993,
-    "trap_risk_threshold": 0.4749,
+    "trap_risk_threshold": 0.4747,
+    "rounding_epsilon": 0.00005,
     "target_alpha": 0.02,
     "n_total": 300,
     "n_must_s2": 200,
     "n_s1": 100,
     "empirical_false_fast_route_rate": 0.0,
-    "wilson95_false_fast_route_upper": 0.0188,
-    "conformal_risk_bound": 0.005,
-    "achieved_s1_recall": 1.0
+    "worst_case_rounding_false_fast_route_count": 0,
+    "wilson95_false_fast_route_upper_descriptive": 0.0188,
+    "conformal_risk_bound_descriptive": 0.005,
+    "achieved_s1_recall": 1.0,
+    "note": "In-sample 2D grid calibration is descriptive, not a formal out-of-sample coverage guarantee."
   },
   "five_fold_oos_validation": {
-    "folds": 5,
-    "target_alpha": 0.02,
-    "oos_false_fast_route_count": 3,
-    "oos_false_fast_route_total_must_s2": 200,
-    "oos_false_fast_route_rate": 0.015,
-    "oos_s1_recall": 1.0
+    "seed": 42,
+    "rounding_epsilon": 0.00005,
+    "random_5fold": {
+      "oos_false_fast_route_count": 3,
+      "oos_false_fast_route_total_must_s2": 200,
+      "oos_false_fast_route_rate": 0.015,
+      "wilson95_interval": [0.0051, 0.0432],
+      "clopper_pearson_onesided95_upper": 0.03831,
+      "oos_s1_recall": 1.0,
+      "error_ids": ["amb_056", "amb_076", "amb_075"]
+    },
+    "stratified_5fold": {
+      "oos_false_fast_route_count": 2,
+      "oos_false_fast_route_total_must_s2": 200,
+      "oos_false_fast_route_rate": 0.01,
+      "wilson95_interval": [0.0027, 0.0357],
+      "clopper_pearson_onesided95_upper": 0.031143,
+      "oos_s1_recall": 1.0,
+      "error_ids": ["amb_076", "amb_056"]
+    }
   },
   "wall_clock_seconds": 199.29
 }

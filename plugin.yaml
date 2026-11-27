@@ -4,7 +4,7 @@
 # only when `manifest_version >= 2`. Omitting `manifest_version` keeps `config_schema`,
 # `capabilities`, `requires_hermes`, and `provides_middleware` fully active with zero warnings.
 name: trismegistus
-version: "0.3.2"
+version: "0.3.3"
 requires_hermes: ">=0.23.0"
 author: Jorge Luis Revilla
 license: MIT
